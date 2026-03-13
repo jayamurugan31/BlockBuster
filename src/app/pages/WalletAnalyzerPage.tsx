@@ -1,7 +1,6 @@
-import { useState, useEffect, useRef } from "react";
+import { useMemo, useRef, useState, useEffect } from "react";
 import {
   Search,
-  Shield,
   AlertTriangle,
   Activity,
   Copy,
@@ -9,140 +8,338 @@ import {
   Clock,
   ArrowUpRight,
   ArrowDownLeft,
-  Globe,
-  Tag,
-  Zap,
-  ChevronRight,
+  Network,
+  Plus,
+  Minus,
+  RotateCcw,
 } from "lucide-react";
-import {
-  AreaChart,
-  Area,
-  XAxis,
-  YAxis,
-  Tooltip,
-  ResponsiveContainer,
-} from "recharts";
-import {
-  walletNodes,
-  transactions,
-  walletHistory,
-  WalletNode,
-  getRiskColor,
-  getRiskLabel,
-  formatAddress,
-  timeAgo,
-} from "../data/mockData";
+import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
+import { analyzeWallet, predictAllAiFeatures, type WalletAnalysisResponse, type FlowTransaction, type MlAllFeaturesResponse } from "../api/walletAnalyzerApi";
+import { getRiskColor, getRiskLabel, formatAddress, timeAgo } from "../data/mockData";
 
-const QUICK_ADDRESSES = walletNodes.map((w) => ({
-  label: w.label,
-  address: w.address,
-  risk: w.risk,
-}));
+interface Counterparty {
+  address: string;
+  txCount: number;
+  suspiciousTxCount: number;
+  risk: number;
+}
 
-function MiniFlowGraph({ wallet }: { wallet: WalletNode }) {
-  const canvasRef = useRef<HTMLCanvasElement>(null);
+function MiniFlowGraph({
+  walletAddress,
+  counterparties,
+  suspiciousPairs,
+}: {
+  walletAddress: string;
+  counterparties: Counterparty[];
+  suspiciousPairs: Set<string>;
+}) {
+  const VIEW_WIDTH = 760;
+  const VIEW_HEIGHT = 460;
+  const CENTER_X = VIEW_WIDTH / 2;
+  const CENTER_Y = VIEW_HEIGHT / 2;
+  const MIN_ZOOM = 0.9;
+  const MAX_ZOOM = 2.2;
+
+  const [zoom, setZoom] = useState(1.05);
+  const [pan, setPan] = useState({ x: 0, y: 0 });
+  const [isPanning, setIsPanning] = useState(false);
+  const [hoveredAddress, setHoveredAddress] = useState<string | null>(null);
+  const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
+
+  const clampPan = (nextX: number, nextY: number, nextZoom: number) => {
+    const maxX = Math.max(0, ((VIEW_WIDTH * (nextZoom - 1)) / 2) + 120);
+    const maxY = Math.max(0, ((VIEW_HEIGHT * (nextZoom - 1)) / 2) + 90);
+    return {
+      x: Math.max(-maxX, Math.min(maxX, nextX)),
+      y: Math.max(-maxY, Math.min(maxY, nextY)),
+    };
+  };
+
+  const nodes = useMemo(() => {
+    const ranked = counterparties.slice(0, 10);
+    return ranked.map((node, index) => {
+      const angle = (index / Math.max(1, ranked.length)) * Math.PI * 2 - Math.PI / 2;
+      const ring = index < 5 ? 150 : 202;
+      const radius = ring + (index % 2 === 0 ? 8 : -8);
+      const x = CENTER_X + Math.cos(angle) * radius;
+      const y = CENTER_Y + Math.sin(angle) * radius;
+      const pairKey = [walletAddress, node.address].sort().join("|");
+      const suspicious = suspiciousPairs.has(pairKey);
+      const nodeRadius = Math.min(20, 10 + node.txCount * 0.85 + node.suspiciousTxCount * 2.4);
+
+      return {
+        ...node,
+        x,
+        y,
+        suspicious,
+        nodeRadius,
+        pairKey,
+      };
+    });
+  }, [counterparties, suspiciousPairs, walletAddress]);
+
+  const hoveredNode = nodes.find((node) => node.address === hoveredAddress) ?? null;
 
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const ctx = canvas.getContext("2d");
-    if (!ctx) return;
+    setZoom(1.05);
+    setPan({ x: 0, y: 0 });
+    setHoveredAddress(null);
+    setIsPanning(false);
+    dragRef.current = null;
+  }, [walletAddress]);
 
-    canvas.width = 400;
-    canvas.height = 220;
+  useEffect(() => {
+    setPan((prev) => clampPan(prev.x, prev.y, zoom));
+  }, [zoom]);
 
-    const W = 400;
-    const H = 220;
-    const cx = W / 2;
-    const cy = H / 2;
-
-    // Background
-    ctx.fillStyle = "#070d1a";
-    ctx.fillRect(0, 0, W, H);
-
-    const walletTxs = transactions.filter((t) => t.from === wallet.id || t.to === wallet.id);
-    const connectedIds = new Set<string>();
-    walletTxs.forEach((t) => {
-      if (t.from !== wallet.id) connectedIds.add(t.from);
-      if (t.to !== wallet.id) connectedIds.add(t.to);
+  const zoomBy = (delta: number) => {
+    setZoom((prev) => {
+      const nextZoom = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, Number((prev + delta).toFixed(2))));
+      setPan((oldPan) => clampPan(oldPan.x, oldPan.y, nextZoom));
+      return nextZoom;
     });
-    const connected = walletNodes.filter((w) => connectedIds.has(w.id));
-
-    // Draw center node
-    const drawNode = (x: number, y: number, w: WalletNode, isCenter: boolean) => {
-      const r = isCenter ? 22 : 14;
-      const color = getRiskColor(w.risk);
-
-      // Glow
-      const grd = ctx.createRadialGradient(x, y, 0, x, y, r * 2.5);
-      grd.addColorStop(0, color + "44");
-      grd.addColorStop(1, "transparent");
-      ctx.beginPath();
-      ctx.arc(x, y, r * 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = grd;
-      ctx.fill();
-
-      // Node
-      ctx.beginPath();
-      ctx.arc(x, y, r, 0, Math.PI * 2);
-      ctx.fillStyle = "#0a1628";
-      ctx.fill();
-      ctx.strokeStyle = color;
-      ctx.lineWidth = isCenter ? 2 : 1.5;
-      ctx.stroke();
-
-      // Label
-      ctx.font = `${isCenter ? 12 : 9}px 'Space Grotesk', sans-serif`;
-      ctx.textAlign = "center";
-      ctx.textBaseline = "bottom";
-      ctx.fillStyle = color;
-      ctx.fillText(w.label.split(" ")[0], x, y - r - 3);
-
-      // Risk badge
-      ctx.font = "bold 8px 'Space Grotesk', sans-serif";
-      ctx.fillStyle = color;
-      ctx.fillText(`${w.risk}`, x, y + r + 12);
-    };
-
-    const nodePositions: { id: string; x: number; y: number }[] = [{ id: wallet.id, x: cx, y: cy }];
-
-    connected.forEach((w, i) => {
-      const angle = (i / connected.length) * Math.PI * 2 - Math.PI / 2;
-      const radius = 85;
-      const x = cx + Math.cos(angle) * radius;
-      const y = cy + Math.sin(angle) * radius;
-      nodePositions.push({ id: w.id, x, y });
-
-      // Edge
-      const tx = walletTxs.find((t) => (t.from === w.id || t.to === w.id));
-      const suspicious = tx?.suspicious ?? false;
-
-      ctx.beginPath();
-      ctx.moveTo(cx, cy);
-      const mx = (cx + x) / 2 + (cy - y) * 0.15;
-      const my = (cy + y) / 2 + (x - cx) * 0.15;
-      ctx.quadraticCurveTo(mx, my, x, y);
-      ctx.strokeStyle = suspicious ? "#ff2b4a66" : "#0e6cc466";
-      ctx.lineWidth = suspicious ? 1.5 : 1;
-      ctx.setLineDash(suspicious ? [] : [4, 4]);
-      ctx.stroke();
-      ctx.setLineDash([]);
-
-      drawNode(x, y, w, false);
-    });
-
-    drawNode(cx, cy, wallet, true);
-  }, [wallet]);
+  };
 
   return (
-    <canvas
-      ref={canvasRef}
-      style={{ width: "100%", height: "100%", borderRadius: 8 }}
-    />
+    <div style={{ position: "relative", width: "100%", height: "100%" }}>
+      <div style={{ position: "absolute", top: 10, right: 10, zIndex: 3, display: "flex", gap: 6 }}>
+        <button
+          onClick={() => zoomBy(0.16)}
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 8,
+            border: "1px solid #25466b",
+            background: "rgba(5,12,22,0.88)",
+            color: "#9bc6ea",
+            cursor: "pointer",
+            display: "grid",
+            placeItems: "center",
+          }}
+          title="Zoom in"
+        >
+          <Plus size={14} />
+        </button>
+        <button
+          onClick={() => zoomBy(-0.16)}
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 8,
+            border: "1px solid #25466b",
+            background: "rgba(5,12,22,0.88)",
+            color: "#9bc6ea",
+            cursor: "pointer",
+            display: "grid",
+            placeItems: "center",
+          }}
+          title="Zoom out"
+        >
+          <Minus size={14} />
+        </button>
+        <button
+          onClick={() => {
+            setZoom(1.05);
+            setPan({ x: 0, y: 0 });
+          }}
+          style={{
+            width: 28,
+            height: 28,
+            borderRadius: 8,
+            border: "1px solid #25466b",
+            background: "rgba(5,12,22,0.88)",
+            color: "#9bc6ea",
+            cursor: "pointer",
+            display: "grid",
+            placeItems: "center",
+          }}
+          title="Reset view"
+        >
+          <RotateCcw size={13} />
+        </button>
+      </div>
+
+      <div
+        style={{
+          position: "absolute",
+          left: 10,
+          top: 10,
+          zIndex: 2,
+          background: "rgba(6,12,22,0.72)",
+          border: "1px solid #1d3a5c",
+          borderRadius: 8,
+          padding: "5px 8px",
+          color: "#7ea7c8",
+          fontSize: 10,
+          letterSpacing: "0.04em",
+          fontFamily: "'JetBrains Mono', monospace",
+        }}
+      >
+        WHEEL TO ZOOM · DRAG TO PAN · HOVER NODES
+      </div>
+
+      <svg
+        viewBox={`0 0 ${VIEW_WIDTH} ${VIEW_HEIGHT}`}
+        style={{ width: "100%", height: "100%", display: "block", cursor: isPanning ? "grabbing" : "grab", touchAction: "none" }}
+        onWheel={(event) => {
+          event.preventDefault();
+          const delta = event.deltaY < 0 ? 0.16 : -0.16;
+          zoomBy(delta);
+        }}
+        onPointerDown={(event) => {
+          setIsPanning(true);
+          dragRef.current = { x: event.clientX, y: event.clientY, panX: pan.x, panY: pan.y };
+        }}
+        onPointerMove={(event) => {
+          if (!dragRef.current) return;
+          const rect = event.currentTarget.getBoundingClientRect();
+          const dx = (event.clientX - dragRef.current.x) * (VIEW_WIDTH / rect.width);
+          const dy = (event.clientY - dragRef.current.y) * (VIEW_HEIGHT / rect.height);
+          const nextPan = clampPan(dragRef.current.panX + dx, dragRef.current.panY + dy, zoom);
+          setPan(nextPan);
+        }}
+        onPointerUp={() => {
+          dragRef.current = null;
+          setIsPanning(false);
+        }}
+        onPointerLeave={() => {
+          dragRef.current = null;
+          setIsPanning(false);
+        }}
+      >
+        <defs>
+          <radialGradient id="graphBg" cx="50%" cy="50%" r="80%">
+            <stop offset="0%" stopColor="#0d1a2f" />
+            <stop offset="100%" stopColor="#060d19" />
+          </radialGradient>
+        </defs>
+
+        <rect x={0} y={0} width={VIEW_WIDTH} height={VIEW_HEIGHT} fill="url(#graphBg)" />
+
+        <g transform={`translate(${CENTER_X + pan.x} ${CENTER_Y + pan.y}) scale(${zoom}) translate(${-CENTER_X} ${-CENTER_Y})`}>
+          {[110, 170, 230].map((radius) => (
+            <circle key={radius} cx={CENTER_X} cy={CENTER_Y} r={radius} fill="none" stroke="#113153" strokeWidth={1} strokeDasharray="3 6" />
+          ))}
+
+          {nodes.map((node) => {
+            const controlX = (CENTER_X + node.x) / 2 + (CENTER_Y - node.y) * 0.12;
+            const controlY = (CENTER_Y + node.y) / 2 + (node.x - CENTER_X) * 0.12;
+            const isHovered = hoveredAddress === node.address;
+            return (
+              <path
+                key={node.pairKey}
+                d={`M ${CENTER_X} ${CENTER_Y} Q ${controlX} ${controlY} ${node.x} ${node.y}`}
+                fill="none"
+                stroke={node.suspicious ? "#ff4365" : isHovered ? "#26b8ff" : "#2c7fbe"}
+                strokeWidth={node.suspicious ? 2.2 : isHovered ? 2 : 1.4}
+                strokeDasharray={node.suspicious ? "" : "5 5"}
+                strokeOpacity={node.suspicious ? 0.95 : 0.7}
+              />
+            );
+          })}
+
+          {nodes.map((node) => {
+            const isHovered = hoveredAddress === node.address;
+            return (
+              <g
+                key={node.address}
+                onPointerEnter={() => setHoveredAddress(node.address)}
+                onPointerLeave={() => setHoveredAddress(null)}
+              >
+                <circle
+                  cx={node.x}
+                  cy={node.y}
+                  r={node.nodeRadius + (isHovered ? 3 : 0)}
+                  fill="#081426"
+                  stroke={node.suspicious ? "#ff4365" : getRiskColor(node.risk)}
+                  strokeWidth={isHovered ? 2.5 : 1.6}
+                />
+                <circle
+                  cx={node.x}
+                  cy={node.y}
+                  r={Math.max(3, Math.min(7, node.nodeRadius * 0.35))}
+                  fill={node.suspicious ? "#ff4365" : getRiskColor(node.risk)}
+                  opacity={0.9}
+                />
+              </g>
+            );
+          })}
+
+          <g>
+            <circle cx={CENTER_X} cy={CENTER_Y} r={26} fill="#071427" stroke="#00aaff" strokeWidth={2.6} />
+            <text x={CENTER_X} y={CENTER_Y + 4} fill="#00d4ff" fontSize="12" textAnchor="middle" fontWeight={700} fontFamily="Space Grotesk">
+              YOU
+            </text>
+          </g>
+        </g>
+      </svg>
+
+      <div
+        style={{
+          position: "absolute",
+          bottom: 10,
+          left: 10,
+          right: 10,
+          zIndex: 2,
+          display: "flex",
+          justifyContent: "space-between",
+          gap: 8,
+          alignItems: "flex-end",
+        }}
+      >
+        <div
+          style={{
+            background: "rgba(5,12,22,0.84)",
+            border: "1px solid #1d3a5c",
+            borderRadius: 8,
+            padding: "6px 8px",
+            color: "#8db4d5",
+            fontSize: 10,
+            fontFamily: "'JetBrains Mono', monospace",
+          }}
+        >
+          Zoom {zoom.toFixed(2)}x
+        </div>
+
+        {hoveredNode && (
+          <div
+            style={{
+              background: "rgba(5,12,22,0.94)",
+              border: `1px solid ${hoveredNode.suspicious ? "#ff436577" : "#1d3a5c"}`,
+              borderRadius: 8,
+              padding: "7px 10px",
+              minWidth: 180,
+            }}
+          >
+            <div style={{ color: "#d4e9ff", fontSize: 11, fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>
+              {formatAddress(hoveredNode.address)}
+            </div>
+            <div style={{ color: "#89afcf", fontSize: 10 }}>
+              {hoveredNode.txCount} txs · {hoveredNode.suspiciousTxCount} suspicious · risk {hoveredNode.risk}
+            </div>
+          </div>
+        )}
+
+        {!hoveredNode && (
+          <div
+            style={{
+              background: "rgba(5,12,22,0.84)",
+              border: "1px solid #1d3a5c",
+              borderRadius: 8,
+              padding: "6px 8px",
+              color: "#789ec0",
+              fontSize: 10,
+            }}
+          >
+            Hover a node to view address and stats
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
-const CustomTooltip = ({ active, payload, label }: any) => {
+const ChartTooltip = ({ active, payload, label }: { active?: boolean; payload?: Array<{ value: number; color: string; name: string }>; label?: string }) => {
   if (!active || !payload?.length) return null;
   return (
     <div
@@ -156,9 +353,9 @@ const CustomTooltip = ({ active, payload, label }: any) => {
       }}
     >
       <div style={{ color: "#7a9cc0", marginBottom: 4 }}>{label}</div>
-      {payload.map((p: any) => (
-        <div key={p.dataKey} style={{ color: p.color }}>
-          {p.name}: <strong>{p.value}</strong>
+      {payload.map((p) => (
+        <div key={p.name} style={{ color: p.color }}>
+          {p.name}: <strong>{p.value.toFixed(4)} ETH</strong>
         </div>
       ))}
     </div>
@@ -168,622 +365,412 @@ const CustomTooltip = ({ active, payload, label }: any) => {
 export function WalletAnalyzerPage() {
   const [query, setQuery] = useState("");
   const [analyzing, setAnalyzing] = useState(false);
-  const [result, setResult] = useState<WalletNode | null>(null);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
+  const [analysis, setAnalysis] = useState<WalletAnalysisResponse | null>(null);
+  const [aiFeatures, setAiFeatures] = useState<MlAllFeaturesResponse | null>(null);
   const [copied, setCopied] = useState(false);
-  const [suggestions, setSuggestions] = useState(false);
 
-  const handleAnalyze = (address?: string) => {
-    const addr = address ?? query;
-    if (!addr.trim()) return;
+  const executeAnalysis = async () => {
+    const walletAddress = query.trim();
+    if (!walletAddress) return;
+
     setAnalyzing(true);
-    setResult(null);
-    setSuggestions(false);
-    setTimeout(() => {
-      const found = walletNodes.find(
-        (w) =>
-          w.address.toLowerCase().includes(addr.toLowerCase()) ||
-          w.label.toLowerCase().includes(addr.toLowerCase())
-      ) ?? walletNodes[Math.floor(Math.random() * walletNodes.length)];
-      setResult(found);
+    setErrorMessage(null);
+
+    try {
+      const response = await analyzeWallet(walletAddress);
+      setAnalysis(response);
+      try {
+        const ai = await predictAllAiFeatures(walletAddress);
+        setAiFeatures(ai);
+      } catch {
+        setAiFeatures(null);
+      }
+    } catch (err) {
+      setAnalysis(null);
+      setAiFeatures(null);
+      setErrorMessage(err instanceof Error ? err.message : "Unexpected error during wallet analysis.");
+    } finally {
       setAnalyzing(false);
-    }, 1200);
+    }
   };
 
-  const walletTxs = result
-    ? transactions.filter((t) => t.from === result.id || t.to === result.id)
-    : [];
+  const suspiciousHashes = useMemo(() => {
+    if (!analysis) return new Set<string>();
+    return new Set(analysis.suspicious_transactions.map((tx) => tx.hash));
+  }, [analysis]);
 
-  const copyAddress = () => {
-    if (!result) return;
-    navigator.clipboard.writeText(result.address);
+  const transactions = useMemo(() => {
+    if (!analysis) return [];
+    return [...analysis.transaction_flow].sort(
+      (a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime()
+    );
+  }, [analysis]);
+
+  const counterparties = useMemo(() => {
+    if (!analysis) return [] as Counterparty[];
+
+    const map = new Map<string, Counterparty>();
+    analysis.transaction_flow.forEach((tx) => {
+      const me = analysis.wallet_address.toLowerCase();
+      const from = tx.from.toLowerCase();
+      const other = from === me ? tx.to : tx.from;
+      if (!other || other === analysis.wallet_address) return;
+
+      const entry = map.get(other) ?? {
+        address: other,
+        txCount: 0,
+        suspiciousTxCount: 0,
+        risk: 10,
+      };
+      entry.txCount += 1;
+      if (suspiciousHashes.has(tx.hash)) {
+        entry.suspiciousTxCount += 1;
+      }
+      const riskBoost = Math.min(80, entry.suspiciousTxCount * 25 + Math.min(20, entry.txCount * 3));
+      entry.risk = Math.min(100, 10 + riskBoost);
+      map.set(other, entry);
+    });
+
+    return [...map.values()].sort((a, b) => b.risk - a.risk);
+  }, [analysis, suspiciousHashes]);
+
+  const suspiciousPairs = useMemo(() => {
+    if (!analysis) return new Set<string>();
+    const pairs = new Set<string>();
+    analysis.suspicious_transactions.forEach((tx) => {
+      pairs.add([tx.from.toLowerCase(), tx.to.toLowerCase()].sort().join("|"));
+    });
+    return pairs;
+  }, [analysis]);
+
+  const historyData = useMemo(() => {
+    if (!analysis) return [] as { date: string; volume: number }[];
+
+    const buckets = new Map<string, number>();
+    analysis.transaction_flow.forEach((tx: FlowTransaction) => {
+      const date = tx.timestamp.slice(0, 10);
+      const prev = buckets.get(date) ?? 0;
+      buckets.set(date, prev + tx.value_eth);
+    });
+
+    return [...buckets.entries()]
+      .sort(([a], [b]) => a.localeCompare(b))
+      .slice(-14)
+      .map(([date, volume]) => ({ date, volume: Number(volume.toFixed(6)) }));
+  }, [analysis]);
+
+  const totalVolumeEth = useMemo(() => {
+    return transactions.reduce((sum, tx) => sum + tx.value_eth, 0);
+  }, [transactions]);
+
+  const firstSeen = transactions.at(-1)?.timestamp;
+  const lastSeen = transactions.at(0)?.timestamp;
+
+  const copyAddress = async () => {
+    if (!analysis) return;
+    await navigator.clipboard.writeText(analysis.wallet_address);
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    setTimeout(() => setCopied(false), 1500);
   };
 
   return (
     <div style={{ padding: "28px 32px", fontFamily: "'Space Grotesk', sans-serif", background: "#050912", minHeight: "100%" }}>
-      {/* Header */}
-      <div style={{ marginBottom: 28 }}>
+      <div style={{ marginBottom: 24 }}>
         <h1 style={{ color: "#e2f0ff", margin: 0, fontSize: 22, fontWeight: 700 }}>
           Wallet <span style={{ color: "#00aaff" }}>Analyzer</span>
         </h1>
         <p style={{ color: "#5b7fa6", fontSize: 13, margin: "4px 0 0" }}>
-          Deep-dive analysis on any blockchain wallet address
+          Live Ethereum wallet analysis powered by backend risk heuristics
         </p>
       </div>
 
-      {/* Search */}
       <div
         style={{
           background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
           border: "1px solid #1a3050",
           borderRadius: 12,
           padding: 24,
-          marginBottom: 24,
+          marginBottom: 20,
         }}
       >
-        <div style={{ marginBottom: 16 }}>
-          <div style={{ color: "#7a9cc0", fontSize: 11, letterSpacing: "0.05em", marginBottom: 8 }}>
-            WALLET ADDRESS
-          </div>
-          <div style={{ display: "flex", gap: 10 }}>
-            <div style={{ flex: 1, position: "relative" }}>
-              <Search
-                size={14}
-                style={{
-                  position: "absolute",
-                  left: 14,
-                  top: "50%",
-                  transform: "translateY(-50%)",
-                  color: "#5b7fa6",
-                }}
-              />
-              <input
-                value={query}
-                onChange={(e) => {
-                  setQuery(e.target.value);
-                  setSuggestions(e.target.value.length > 0);
-                }}
-                onKeyDown={(e) => e.key === "Enter" && handleAnalyze()}
-                placeholder="Paste wallet address (0x...) or ENS name"
-                style={{
-                  width: "100%",
-                  background: "#050912",
-                  border: "1px solid #1a3050",
-                  borderRadius: 8,
-                  padding: "12px 14px 12px 40px",
-                  color: "#e2f0ff",
-                  fontSize: 13,
-                  fontFamily: "'JetBrains Mono', monospace",
-                  outline: "none",
-                  boxSizing: "border-box",
-                  transition: "border-color 0.2s",
-                }}
-                onFocus={(e) => {
-                  e.target.style.borderColor = "#00aaff44";
-                  setSuggestions(query.length > 0);
-                }}
-                onBlur={(e) => {
-                  e.target.style.borderColor = "#1a3050";
-                  setTimeout(() => setSuggestions(false), 200);
-                }}
-              />
-              {/* Autocomplete suggestions */}
-              {suggestions && (
-                <div
-                  style={{
-                    position: "absolute",
-                    top: "calc(100% + 4px)",
-                    left: 0,
-                    right: 0,
-                    background: "#0a1628",
-                    border: "1px solid #1a3050",
-                    borderRadius: 8,
-                    zIndex: 50,
-                    overflow: "hidden",
-                  }}
-                >
-                  {QUICK_ADDRESSES.filter(
-                    (w) =>
-                      w.label.toLowerCase().includes(query.toLowerCase()) ||
-                      w.address.toLowerCase().includes(query.toLowerCase())
-                  )
-                    .slice(0, 5)
-                    .map((w) => (
-                      <button
-                        key={w.address}
-                        onMouseDown={() => {
-                          setQuery(w.address);
-                          handleAnalyze(w.address);
-                        }}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
-                          width: "100%",
-                          padding: "10px 14px",
-                          background: "none",
-                          border: "none",
-                          borderBottom: "1px solid #0f1e35",
-                          cursor: "pointer",
-                          textAlign: "left",
-                          fontFamily: "'Space Grotesk', sans-serif",
-                        }}
-                        onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = "#0f1e35")}
-                        onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.background = "none")}
-                      >
-                        <div
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: "50%",
-                            background: getRiskColor(w.risk),
-                            flexShrink: 0,
-                          }}
-                        />
-                        <span style={{ color: "#e2f0ff", fontSize: 12 }}>{w.label}</span>
-                        <span
-                          style={{
-                            color: "#5b7fa6",
-                            fontSize: 10,
-                            fontFamily: "'JetBrains Mono', monospace",
-                            flex: 1,
-                            overflow: "hidden",
-                            textOverflow: "ellipsis",
-                            whiteSpace: "nowrap",
-                          }}
-                        >
-                          {w.address}
-                        </span>
-                        <span
-                          style={{
-                            color: getRiskColor(w.risk),
-                            fontSize: 10,
-                            fontWeight: 700,
-                          }}
-                        >
-                          {w.risk}
-                        </span>
-                      </button>
-                    ))}
-                </div>
-              )}
-            </div>
-            <button
-              onClick={() => handleAnalyze()}
-              disabled={analyzing}
-              style={{
-                padding: "12px 28px",
-                background: analyzing
-                  ? "rgba(0,170,255,0.15)"
-                  : "linear-gradient(135deg, #0060cc, #00aaff)",
-                border: "none",
-                borderRadius: 8,
-                color: analyzing ? "#00aaff" : "#050912",
-                fontSize: 13,
-                fontWeight: 700,
-                cursor: analyzing ? "not-allowed" : "pointer",
-                letterSpacing: "0.05em",
-                fontFamily: "'Space Grotesk', sans-serif",
-                flexShrink: 0,
-                display: "flex",
-                alignItems: "center",
-                gap: 8,
-                transition: "all 0.2s",
-              }}
-            >
-              {analyzing ? (
-                <>
-                  <div
-                    style={{
-                      width: 12,
-                      height: 12,
-                      border: "2px solid #00aaff",
-                      borderTopColor: "transparent",
-                      borderRadius: "50%",
-                      animation: "spin 0.8s linear infinite",
-                    }}
-                  />
-                  ANALYZING...
-                </>
-              ) : (
-                <>
-                  <Search size={13} />
-                  ANALYZE
-                </>
-              )}
-            </button>
-          </div>
+        <div style={{ color: "#7a9cc0", fontSize: 11, letterSpacing: "0.05em", marginBottom: 8 }}>
+          ETHEREUM WALLET ADDRESS
         </div>
-
-        {/* Quick access */}
-        <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
-          <span style={{ color: "#3d5a7a", fontSize: 11 }}>Quick:</span>
-          {QUICK_ADDRESSES.slice(0, 5).map((w) => (
-            <button
-              key={w.address}
-              onClick={() => {
-                setQuery(w.address);
-                handleAnalyze(w.address);
-              }}
+        <div style={{ display: "flex", gap: 10 }}>
+          <div style={{ flex: 1, position: "relative" }}>
+            <Search
+              size={14}
               style={{
-                padding: "3px 10px",
+                position: "absolute",
+                left: 14,
+                top: "50%",
+                transform: "translateY(-50%)",
+                color: "#5b7fa6",
+              }}
+            />
+            <input
+              value={query}
+              onChange={(e) => setQuery(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") void executeAnalysis();
+              }}
+              placeholder="0x..."
+              style={{
+                width: "100%",
                 background: "#050912",
                 border: "1px solid #1a3050",
-                borderRadius: 9999,
-                color: "#7a9cc0",
-                fontSize: 10,
-                cursor: "pointer",
-                display: "flex",
-                alignItems: "center",
-                gap: 5,
-                fontFamily: "'Space Grotesk', sans-serif",
+                borderRadius: 8,
+                padding: "12px 14px 12px 40px",
+                color: "#e2f0ff",
+                fontSize: 13,
+                fontFamily: "'JetBrains Mono', monospace",
+                outline: "none",
+                boxSizing: "border-box",
               }}
-              onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.borderColor = "#00aaff44")}
-              onMouseLeave={(e) => ((e.currentTarget as HTMLElement).style.borderColor = "#1a3050")}
-            >
-              <div
-                style={{
-                  width: 5,
-                  height: 5,
-                  borderRadius: "50%",
-                  background: getRiskColor(w.risk),
-                }}
-              />
-              {w.label}
-            </button>
-          ))}
+            />
+          </div>
+          <button
+            onClick={() => {
+              void executeAnalysis();
+            }}
+            disabled={analyzing}
+            style={{
+              padding: "12px 28px",
+              background: analyzing ? "rgba(0,170,255,0.15)" : "linear-gradient(135deg, #0060cc, #00aaff)",
+              border: "none",
+              borderRadius: 8,
+              color: analyzing ? "#00aaff" : "#050912",
+              fontSize: 13,
+              fontWeight: 700,
+              cursor: analyzing ? "not-allowed" : "pointer",
+              letterSpacing: "0.05em",
+              fontFamily: "'Space Grotesk', sans-serif",
+            }}
+          >
+            {analyzing ? "ANALYZING..." : "ANALYZE"}
+          </button>
         </div>
       </div>
 
-      {/* Empty state */}
-      {!result && !analyzing && (
+      {errorMessage && (
+        <div
+          style={{
+            background: "rgba(255,43,74,0.1)",
+            border: "1px solid rgba(255,43,74,0.35)",
+            borderRadius: 10,
+            padding: "12px 14px",
+            color: "#ff9090",
+            fontSize: 12,
+            marginBottom: 20,
+            display: "flex",
+            alignItems: "center",
+            gap: 8,
+          }}
+        >
+          <AlertTriangle size={14} />
+          {errorMessage}
+        </div>
+      )}
+
+      {!analysis && !analyzing && (
         <div
           style={{
             background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
             border: "1px solid #1a3050",
             borderRadius: 12,
-            padding: 60,
-            textAlign: "center",
-          }}
-        >
-          <div style={{ fontSize: 48, marginBottom: 16 }}>🔍</div>
-          <div style={{ color: "#5b7fa6", fontSize: 14, marginBottom: 8 }}>
-            Enter a wallet address above to begin analysis
-          </div>
-          <div style={{ color: "#3d5a7a", fontSize: 12 }}>
-            Supports ETH, BTC, and all EVM-compatible addresses
-          </div>
-        </div>
-      )}
-
-      {/* Loading */}
-      {analyzing && (
-        <div
-          style={{
-            background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
-            border: "1px solid #00aaff33",
-            borderRadius: 12,
             padding: 48,
             textAlign: "center",
+            color: "#5b7fa6",
+            fontSize: 13,
           }}
         >
-          <div
-            style={{
-              width: 48,
-              height: 48,
-              border: "3px solid #1a3050",
-              borderTopColor: "#00aaff",
-              borderRadius: "50%",
-              animation: "spin 0.8s linear infinite",
-              margin: "0 auto 20px",
-            }}
-          />
-          <div style={{ color: "#00aaff", fontSize: 14, fontWeight: 600, marginBottom: 6 }}>
-            Analyzing blockchain data...
-          </div>
-          <div style={{ color: "#5b7fa6", fontSize: 12 }}>
-            Scanning transaction history • Checking watchlists • Computing risk score
-          </div>
+          Enter an Ethereum wallet address to start live analysis.
         </div>
       )}
 
-      {/* Results */}
-      {result && !analyzing && (
+      {analysis && !analyzing && (
         <div style={{ display: "flex", flexDirection: "column", gap: 20 }}>
-          {/* Wallet overview */}
           <div
             style={{
               background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
-              border: `1px solid ${result.flagged ? "#ff2b4a44" : "#1a3050"}`,
+              border: `1px solid ${analysis.risk_score >= 70 ? "#ff2b4a44" : "#1a3050"}`,
               borderRadius: 12,
               padding: 24,
             }}
           >
-            <div style={{ display: "flex", gap: 24, flexWrap: "wrap" }}>
-              {/* Left info */}
-              <div style={{ flex: 1, minWidth: 280 }}>
-                <div style={{ display: "flex", alignItems: "flex-start", gap: 12, marginBottom: 20 }}>
-                  <div
-                    style={{
-                      width: 48,
-                      height: 48,
-                      borderRadius: 12,
-                      background: `${getRiskColor(result.risk)}18`,
-                      border: `1px solid ${getRiskColor(result.risk)}44`,
-                      display: "flex",
-                      alignItems: "center",
-                      justifyContent: "center",
-                      fontSize: 20,
-                      flexShrink: 0,
+            <div style={{ display: "flex", flexWrap: "wrap", gap: 20 }}>
+              <div style={{ flex: 1, minWidth: 260 }}>
+                <div style={{ display: "flex", alignItems: "center", gap: 8, marginBottom: 10 }}>
+                  <div style={{ color: "#e2f0ff", fontSize: 17, fontWeight: 700 }}>Analyzed Wallet</div>
+                  <button
+                    onClick={() => {
+                      void copyAddress();
                     }}
+                    style={{ background: "none", border: "none", color: copied ? "#00ff9d" : "#5b7fa6", cursor: "pointer" }}
                   >
-                    {result.type === "mixer"
-                      ? "⚡"
-                      : result.type === "darkweb"
-                      ? "💀"
-                      : result.type === "exchange"
-                      ? "🏦"
-                      : result.type === "defi"
-                      ? "🔗"
-                      : "👛"}
-                  </div>
-                  <div>
-                    <div style={{ color: "#e2f0ff", fontSize: 18, fontWeight: 700, marginBottom: 4 }}>
-                      {result.label}
-                    </div>
-                    <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
-                      <span
-                        style={{
-                          color: "#5b7fa6",
-                          fontSize: 11,
-                          fontFamily: "'JetBrains Mono', monospace",
-                        }}
-                      >
-                        {formatAddress(result.address)}
-                      </span>
-                      <button
-                        onClick={copyAddress}
-                        style={{
-                          background: "none",
-                          border: "none",
-                          color: copied ? "#00ff9d" : "#5b7fa6",
-                          cursor: "pointer",
-                          padding: 0,
-                          display: "flex",
-                        }}
-                      >
-                        {copied ? <CheckCheck size={12} /> : <Copy size={12} />}
-                      </button>
-                    </div>
-                  </div>
-                  {result.flagged && (
-                    <div
-                      style={{
-                        marginLeft: "auto",
-                        padding: "6px 12px",
-                        background: "rgba(255,43,74,0.12)",
-                        border: "1px solid rgba(255,43,74,0.3)",
-                        borderRadius: 6,
-                        color: "#ff2b4a",
-                        fontSize: 11,
-                        fontWeight: 700,
-                        display: "flex",
-                        alignItems: "center",
-                        gap: 6,
-                      }}
-                    >
-                      <AlertTriangle size={12} />
-                      FLAGGED
-                    </div>
-                  )}
+                    {copied ? <CheckCheck size={13} /> : <Copy size={13} />}
+                  </button>
+                </div>
+                <div style={{ color: "#7a9cc0", fontSize: 12, fontFamily: "'JetBrains Mono', monospace", marginBottom: 14 }}>
+                  {analysis.wallet_address}
                 </div>
 
-                {/* Risk bar */}
-                <div style={{ marginBottom: 20 }}>
-                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 8 }}>
-                    <span style={{ color: "#7a9cc0", fontSize: 12 }}>Risk Score</span>
-                    <span style={{ color: getRiskColor(result.risk), fontSize: 12, fontWeight: 700 }}>
-                      {result.risk}/100 — {getRiskLabel(result.risk)}
+                <div style={{ marginBottom: 14 }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", marginBottom: 6 }}>
+                    <span style={{ color: "#7a9cc0", fontSize: 11 }}>Risk Score</span>
+                    <span style={{ color: getRiskColor(analysis.risk_score), fontSize: 11, fontWeight: 700 }}>
+                      {analysis.risk_score}/100 - {getRiskLabel(analysis.risk_score)}
                     </span>
                   </div>
                   <div style={{ height: 8, background: "#0f1e35", borderRadius: 4, overflow: "hidden" }}>
                     <div
                       style={{
                         height: "100%",
-                        width: `${result.risk}%`,
-                        background: `linear-gradient(90deg, #00ff9d, ${getRiskColor(result.risk)})`,
-                        borderRadius: 4,
-                        transition: "width 0.8s ease",
-                        boxShadow: `0 0 8px ${getRiskColor(result.risk)}88`,
+                        width: `${analysis.risk_score}%`,
+                        background: `linear-gradient(90deg, #00ff9d, ${getRiskColor(analysis.risk_score)})`,
                       }}
                     />
                   </div>
                 </div>
 
-                {/* Grid stats */}
-                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+                {aiFeatures && (
+                  <div style={{ marginBottom: 14, background: "#050912", border: "1px solid #0f1e35", borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ color: "#7a9cc0", fontSize: 10, letterSpacing: "0.05em", marginBottom: 8 }}>AI MODEL SIGNALS</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Anomaly</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 10, textAlign: "right" }}>
+                        {aiFeatures.models.transaction_anomaly_detector?.is_anomaly ? "Detected" : "Normal"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Behavior Shift</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 10, textAlign: "right" }}>
+                        {aiFeatures.models.behavior_shift_detector?.behavior_shift_detected ? "Detected" : "None"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Entity Type</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 10, textAlign: "right" }}>
+                        {aiFeatures.models.entity_type_classifier?.entity_type ?? "Unknown"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Priority Score</div>
+                      <div style={{ color: "#ff7700", fontSize: 10, textAlign: "right", fontWeight: 700 }}>
+                        {aiFeatures.models.alert_prioritizer?.priority_score?.toFixed(1) ?? "-"}
+                      </div>
+                    </div>
+                  </div>
+                )}
+
+                <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                   {[
-                    { icon: Activity, label: "Balance", value: `${result.balance} ${result.currency}` },
-                    { icon: Zap, label: "Transactions", value: result.transactionCount.toLocaleString() },
-                    { icon: Clock, label: "First Seen", value: result.firstSeen },
-                    { icon: Globe, label: "Country", value: result.country ?? "Unknown" },
+                    { icon: Activity, label: "Total Transactions", value: analysis.total_transactions.toLocaleString() },
+                    { icon: AlertTriangle, label: "Suspicious", value: analysis.suspicious_transactions.length.toLocaleString() },
+                    { icon: Network, label: "Counterparties", value: counterparties.length.toLocaleString() },
+                    { icon: Clock, label: "Last Activity", value: lastSeen ? timeAgo(lastSeen) : "N/A" },
                   ].map(({ icon: Icon, label, value }) => (
-                    <div
-                      key={label}
-                      style={{
-                        background: "#050912",
-                        border: "1px solid #0f1e35",
-                        borderRadius: 8,
-                        padding: "12px 14px",
-                      }}
-                    >
-                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 6 }}>
-                        <Icon size={12} color="#5b7fa6" />
+                    <div key={label} style={{ background: "#050912", border: "1px solid #0f1e35", borderRadius: 8, padding: "10px 12px" }}>
+                      <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: 4 }}>
+                        <Icon size={11} color="#5b7fa6" />
                         <span style={{ color: "#5b7fa6", fontSize: 10 }}>{label}</span>
                       </div>
                       <div style={{ color: "#e2f0ff", fontSize: 13, fontWeight: 600 }}>{value}</div>
                     </div>
                   ))}
                 </div>
-
-                {/* Tags */}
-                <div style={{ display: "flex", gap: 6, flexWrap: "wrap", marginTop: 14 }}>
-                  <Tag size={12} color="#3d5a7a" />
-                  {result.tags.map((tag) => (
-                    <span
-                      key={tag}
-                      style={{
-                        padding: "2px 10px",
-                        background: result.flagged ? "rgba(255,43,74,0.1)" : "rgba(0,170,255,0.1)",
-                        border: `1px solid ${result.flagged ? "#ff2b4a33" : "#00aaff33"}`,
-                        borderRadius: 9999,
-                        color: result.flagged ? "#ff9090" : "#5bb0ff",
-                        fontSize: 10,
-                        fontWeight: 600,
-                      }}
-                    >
-                      {tag}
-                    </span>
-                  ))}
-                </div>
               </div>
 
-              {/* Mini flow graph */}
-              <div style={{ width: 400, flexShrink: 0 }}>
+              <div style={{ width: 420, maxWidth: "100%" }}>
                 <div style={{ color: "#7a9cc0", fontSize: 11, letterSpacing: "0.05em", marginBottom: 8 }}>
                   CONNECTION GRAPH
                 </div>
-                <div
-                  style={{
-                    background: "#070d1a",
-                    border: "1px solid #1a3050",
-                    borderRadius: 10,
-                    overflow: "hidden",
-                    height: 220,
-                  }}
-                >
-                  <MiniFlowGraph wallet={result} />
+                <div style={{ background: "#070d1a", border: "1px solid #1a3050", borderRadius: 10, height: 320, overflow: "hidden" }}>
+                  <MiniFlowGraph
+                    walletAddress={analysis.wallet_address.toLowerCase()}
+                    counterparties={counterparties}
+                    suspiciousPairs={suspiciousPairs}
+                  />
                 </div>
               </div>
             </div>
           </div>
 
-          {/* Charts + History */}
-          <div style={{ display: "flex", gap: 20 }}>
-            {/* Volume chart */}
+          <div style={{ display: "flex", gap: 20, flexWrap: "wrap" }}>
             <div
               style={{
                 flex: 2,
+                minWidth: 320,
                 background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
                 border: "1px solid #1a3050",
                 borderRadius: 12,
                 padding: 24,
               }}
             >
-              <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>
-                Transaction History
+              <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Volume History</div>
+              <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 14 }}>
+                Total analyzed volume: {totalVolumeEth.toFixed(4)} ETH
+                {firstSeen ? ` • first seen ${new Date(firstSeen).toLocaleDateString()}` : ""}
               </div>
-              <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 20 }}>Volume over time</div>
               <ResponsiveContainer width="100%" height={180}>
-                <AreaChart data={walletHistory}>
+                <AreaChart data={historyData}>
                   <defs>
-                    <linearGradient id="histGrad" x1="0" y1="0" x2="0" y2="1">
+                    <linearGradient id="historyGradient" x1="0" y1="0" x2="0" y2="1">
                       <stop offset="5%" stopColor="#00aaff" stopOpacity={0.3} />
                       <stop offset="95%" stopColor="#00aaff" stopOpacity={0} />
                     </linearGradient>
                   </defs>
                   <XAxis dataKey="date" tick={{ fill: "#5b7fa6", fontSize: 10 }} axisLine={false} tickLine={false} />
                   <YAxis tick={{ fill: "#5b7fa6", fontSize: 10 }} axisLine={false} tickLine={false} />
-                  <Tooltip content={<CustomTooltip />} />
-                  <Area
-                    type="monotone"
-                    dataKey="volume"
-                    name="Volume (ETH)"
-                    stroke="#00aaff"
-                    strokeWidth={2}
-                    fill="url(#histGrad)"
-                  />
+                  <Tooltip content={<ChartTooltip />} />
+                  <Area type="monotone" dataKey="volume" name="Volume" stroke="#00aaff" strokeWidth={2} fill="url(#historyGradient)" />
                 </AreaChart>
               </ResponsiveContainer>
             </div>
 
-            {/* Connected wallets */}
             <div
               style={{
                 flex: 1,
+                minWidth: 280,
                 background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
                 border: "1px solid #1a3050",
                 borderRadius: 12,
                 padding: 24,
               }}
             >
-              <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>
-                Connected Wallets
-              </div>
-              <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 16 }}>
-                {walletTxs.length} linked transactions
+              <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Top Counterparties</div>
+              <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 14 }}>
+                Ranked by derived counterparty risk
               </div>
               <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
-                {[...new Set([...walletTxs.map((t) => t.from), ...walletTxs.map((t) => t.to)])]
-                  .filter((id) => id !== result.id)
-                  .map((id) => {
-                    const w = walletNodes.find((n) => n.id === id);
-                    if (!w) return null;
-                    return (
-                      <div
-                        key={id}
-                        style={{
-                          display: "flex",
-                          alignItems: "center",
-                          gap: 10,
-                          padding: "8px 10px",
-                          background: w.flagged ? "rgba(255,43,74,0.05)" : "rgba(0,0,0,0.2)",
-                          border: `1px solid ${w.flagged ? "#ff2b4a22" : "#0f1e35"}`,
-                          borderRadius: 8,
-                        }}
-                      >
-                        <div
-                          style={{
-                            width: 8,
-                            height: 8,
-                            borderRadius: "50%",
-                            background: getRiskColor(w.risk),
-                            flexShrink: 0,
-                          }}
-                        />
-                        <div style={{ flex: 1, minWidth: 0 }}>
-                          <div style={{ color: "#e2f0ff", fontSize: 11, fontWeight: 600 }}>{w.label}</div>
-                          <div
-                            style={{
-                              color: "#5b7fa6",
-                              fontSize: 9,
-                              fontFamily: "'JetBrains Mono', monospace",
-                              overflow: "hidden",
-                              textOverflow: "ellipsis",
-                              whiteSpace: "nowrap",
-                            }}
-                          >
-                            {formatAddress(w.address)}
-                          </div>
-                        </div>
-                        <span
-                          style={{
-                            color: getRiskColor(w.risk),
-                            fontSize: 10,
-                            fontWeight: 700,
-                          }}
-                        >
-                          {w.risk}
-                        </span>
+                {counterparties.slice(0, 6).map((party) => (
+                  <div
+                    key={party.address}
+                    style={{
+                      display: "flex",
+                      alignItems: "center",
+                      gap: 8,
+                      padding: "8px 10px",
+                      background: party.risk >= 70 ? "rgba(255,43,74,0.07)" : "rgba(0,0,0,0.2)",
+                      border: `1px solid ${party.risk >= 70 ? "#ff2b4a22" : "#0f1e35"}`,
+                      borderRadius: 8,
+                    }}
+                  >
+                    <div style={{ width: 8, height: 8, borderRadius: "50%", background: getRiskColor(party.risk), flexShrink: 0 }} />
+                    <div style={{ flex: 1, minWidth: 0 }}>
+                      <div style={{ color: "#e2f0ff", fontSize: 11, fontFamily: "'JetBrains Mono', monospace" }}>
+                        {formatAddress(party.address)}
                       </div>
-                    );
-                  })}
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>
+                        {party.txCount} txs • {party.suspiciousTxCount} suspicious
+                      </div>
+                    </div>
+                    <span style={{ color: getRiskColor(party.risk), fontSize: 10, fontWeight: 700 }}>{party.risk}</span>
+                  </div>
+                ))}
+                {counterparties.length === 0 && <div style={{ color: "#5b7fa6", fontSize: 12 }}>No counterparties found.</div>}
               </div>
             </div>
           </div>
 
-          {/* Transaction table */}
           <div
             style={{
               background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
@@ -792,25 +779,17 @@ export function WalletAnalyzerPage() {
               overflow: "hidden",
             }}
           >
-            <div
-              style={{
-                padding: "16px 24px",
-                borderBottom: "1px solid #1a3050",
-                color: "#e2f0ff",
-                fontWeight: 700,
-                fontSize: 14,
-              }}
-            >
-              Transaction History ({walletTxs.length} total)
+            <div style={{ padding: "14px 20px", borderBottom: "1px solid #1a3050", color: "#e2f0ff", fontWeight: 700, fontSize: 14 }}>
+              Recent Transactions ({transactions.length} total)
             </div>
             <table style={{ width: "100%", borderCollapse: "collapse" }}>
               <thead>
                 <tr style={{ background: "rgba(0,0,0,0.3)" }}>
-                  {["Direction", "Counterparty", "Amount", "USD Value", "Risk", "Time"].map((h) => (
+                  {["Direction", "Counterparty", "Amount", "Risk", "Time"].map((heading) => (
                     <th
-                      key={h}
+                      key={heading}
                       style={{
-                        padding: "10px 20px",
+                        padding: "10px 16px",
                         color: "#3d5a7a",
                         fontSize: 10,
                         fontWeight: 600,
@@ -818,82 +797,52 @@ export function WalletAnalyzerPage() {
                         textAlign: "left",
                       }}
                     >
-                      {h}
+                      {heading}
                     </th>
                   ))}
                 </tr>
               </thead>
               <tbody>
-                {walletTxs.map((tx) => {
-                  const isOut = tx.from === result.id;
-                  const other = walletNodes.find((w) => w.id === (isOut ? tx.to : tx.from));
+                {transactions.slice(0, 20).map((tx) => {
+                  const isOutbound = tx.from.toLowerCase() === analysis.wallet_address.toLowerCase();
+                  const other = isOutbound ? tx.to : tx.from;
+                  const txRisk = suspiciousHashes.has(tx.hash) ? 85 : 15;
                   return (
                     <tr
-                      key={tx.id}
+                      key={tx.hash}
                       style={{
                         borderTop: "1px solid #0f1e35",
-                        background: tx.suspicious ? "rgba(255,43,74,0.04)" : "transparent",
+                        background: suspiciousHashes.has(tx.hash) ? "rgba(255,43,74,0.05)" : "transparent",
                       }}
-                      onMouseEnter={(e) => ((e.currentTarget as HTMLElement).style.background = "#0a1628")}
-                      onMouseLeave={(e) =>
-                        ((e.currentTarget as HTMLElement).style.background = tx.suspicious
-                          ? "rgba(255,43,74,0.04)"
-                          : "transparent")
-                      }
                     >
-                      <td style={{ padding: "12px 20px" }}>
-                        <div
-                          style={{
-                            display: "flex",
-                            alignItems: "center",
-                            gap: 6,
-                            color: isOut ? "#ff7700" : "#00ff9d",
-                            fontSize: 11,
-                            fontWeight: 600,
-                          }}
-                        >
-                          {isOut ? <ArrowUpRight size={12} /> : <ArrowDownLeft size={12} />}
-                          {isOut ? "SENT" : "RECEIVED"}
+                      <td style={{ padding: "10px 16px" }}>
+                        <div style={{ display: "flex", alignItems: "center", gap: 6, color: isOutbound ? "#ff7700" : "#00ff9d", fontSize: 11, fontWeight: 600 }}>
+                          {isOutbound ? <ArrowUpRight size={12} /> : <ArrowDownLeft size={12} />}
+                          {isOutbound ? "SENT" : "RECEIVED"}
                         </div>
                       </td>
-                      <td style={{ padding: "12px 20px" }}>
-                        <div style={{ color: (other?.risk ?? 0) >= 80 ? "#ff6b7a" : "#e2f0ff", fontSize: 12 }}>
-                          {other?.label ?? "Unknown"}
-                        </div>
-                        <div
-                          style={{
-                            color: "#5b7fa6",
-                            fontSize: 10,
-                            fontFamily: "'JetBrains Mono', monospace",
-                          }}
-                        >
-                          {formatAddress(other?.address ?? "")}
-                        </div>
+                      <td style={{ padding: "10px 16px", color: "#7a9cc0", fontFamily: "'JetBrains Mono', monospace", fontSize: 11 }}>
+                        {formatAddress(other)}
                       </td>
-                      <td style={{ padding: "12px 20px", color: "#e2f0ff", fontSize: 12, fontWeight: 600 }}>
-                        {tx.amount} {tx.currency}
+                      <td style={{ padding: "10px 16px", color: "#e2f0ff", fontSize: 12, fontWeight: 600 }}>
+                        {tx.value_eth.toFixed(6)} ETH
                       </td>
-                      <td style={{ padding: "12px 20px", color: "#7a9cc0", fontSize: 12 }}>
-                        ${tx.usdValue.toLocaleString()}
-                      </td>
-                      <td style={{ padding: "12px 20px" }}>
+                      <td style={{ padding: "10px 16px" }}>
                         <span
                           style={{
                             padding: "2px 8px",
-                            background: `${getRiskColor(tx.riskScore)}18`,
-                            border: `1px solid ${getRiskColor(tx.riskScore)}33`,
+                            background: `${getRiskColor(txRisk)}18`,
+                            border: `1px solid ${getRiskColor(txRisk)}33`,
                             borderRadius: 9999,
-                            color: getRiskColor(tx.riskScore),
+                            color: getRiskColor(txRisk),
                             fontSize: 10,
                             fontWeight: 700,
                           }}
                         >
-                          {tx.riskScore}
+                          {txRisk}
                         </span>
                       </td>
-                      <td style={{ padding: "12px 20px", color: "#5b7fa6", fontSize: 11 }}>
-                        {timeAgo(tx.timestamp)}
-                      </td>
+                      <td style={{ padding: "10px 16px", color: "#5b7fa6", fontSize: 11 }}>{timeAgo(tx.timestamp)}</td>
                     </tr>
                   );
                 })}
@@ -902,14 +851,6 @@ export function WalletAnalyzerPage() {
           </div>
         </div>
       )}
-
-      <style>{`
-        @keyframes spin {
-          from { transform: rotate(0deg); }
-          to { transform: rotate(360deg); }
-        }
-        input::placeholder { color: #3d5a7a; }
-      `}</style>
     </div>
   );
 }

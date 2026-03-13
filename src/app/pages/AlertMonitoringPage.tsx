@@ -26,13 +26,12 @@ import {
   Cell,
 } from "recharts";
 import {
-  alerts,
-  hourlyAlerts,
   Alert,
   getSeverityColor,
   formatAddress,
   timeAgo,
 } from "../data/mockData";
+import { useAnalyticsDataWithAi } from "../hooks/useAnalyticsData";
 
 const TYPE_CONFIG: Record<
   Alert["type"],
@@ -53,12 +52,18 @@ const SEVERITY_ORDER: Record<Alert["severity"], number> = {
 };
 
 export function AlertMonitoringPage() {
+  const { data, error } = useAnalyticsDataWithAi();
+  const { alerts, hourlyAlerts } = data;
   const [filter, setFilter] = useState<"all" | Alert["severity"]>("all");
   const [typeFilter, setTypeFilter] = useState<"all" | Alert["type"]>("all");
   const [showResolved, setShowResolved] = useState(false);
   const [selected, setSelected] = useState<Alert | null>(null);
-  const [localAlerts, setLocalAlerts] = useState<Alert[]>(alerts);
+  const [localAlerts, setLocalAlerts] = useState<Alert[]>([]);
   const [liveStream, setLiveStream] = useState<Alert[]>([]);
+
+  useEffect(() => {
+    setLocalAlerts(alerts);
+  }, [alerts]);
 
   // Simulate live alerts
   useEffect(() => {
@@ -134,6 +139,14 @@ export function AlertMonitoringPage() {
 
   const unreadCount = localAlerts.filter((a) => !a.read).length;
   const criticalCount = localAlerts.filter((a) => a.severity === "critical" && !a.resolved).length;
+  const aiInsights = data.aiInsights ?? {};
+  const aiValues = Object.values(aiInsights);
+  const aiPriorityAvg = aiValues.length
+    ? aiValues.reduce((sum, item) => sum + (item.models.alert_prioritizer?.priority_score ?? 0), 0) / aiValues.length
+    : 0;
+  const aiAnomalyRate = aiValues.length
+    ? (aiValues.filter((item) => item.models.transaction_anomaly_detector?.is_anomaly).length / aiValues.length) * 100
+    : 0;
 
   const CustomTooltip = ({ active, payload, label }: any) => {
     if (!active || !payload?.length) return null;
@@ -156,6 +169,22 @@ export function AlertMonitoringPage() {
 
   return (
     <div style={{ padding: "28px 32px", fontFamily: "'Space Grotesk', sans-serif", background: "#050912", minHeight: "100%" }}>
+      {error && (
+        <div
+          style={{
+            marginBottom: 16,
+            padding: "10px 12px",
+            borderRadius: 8,
+            border: "1px solid rgba(255,43,74,0.35)",
+            background: "rgba(255,43,74,0.08)",
+            color: "#ff9090",
+            fontSize: 12,
+          }}
+        >
+          Unable to refresh backend alerts: {error}
+        </div>
+      )}
+
       {/* Header */}
       <div style={{ marginBottom: 24, display: "flex", justifyContent: "space-between", alignItems: "flex-end" }}>
         <div>
@@ -263,6 +292,21 @@ export function AlertMonitoringPage() {
               </Bar>
             </BarChart>
           </ResponsiveContainer>
+        </div>
+      </div>
+
+      <div style={{ display: "flex", gap: 12, marginBottom: 20 }}>
+        <div style={{ flex: 1, background: "#081426", border: "1px solid #1a3050", borderRadius: 10, padding: "10px 12px" }}>
+          <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 3 }}>AI AVG PRIORITY</div>
+          <div style={{ color: "#00aaff", fontSize: 18, fontWeight: 700 }}>{aiPriorityAvg.toFixed(1)}</div>
+        </div>
+        <div style={{ flex: 1, background: "#081426", border: "1px solid #1a3050", borderRadius: 10, padding: "10px 12px" }}>
+          <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 3 }}>AI ANOMALY RATE</div>
+          <div style={{ color: "#ff7700", fontSize: 18, fontWeight: 700 }}>{aiAnomalyRate.toFixed(1)}%</div>
+        </div>
+        <div style={{ flex: 1, background: "#081426", border: "1px solid #1a3050", borderRadius: 10, padding: "10px 12px" }}>
+          <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 3 }}>AI INTEGRATION ERRORS</div>
+          <div style={{ color: "#ff2b4a", fontSize: 18, fontWeight: 700 }}>{data.aiIntegration?.errors?.length ?? 0}</div>
         </div>
       </div>
 
