@@ -1,5 +1,5 @@
-import { useState } from "react";
-import { Outlet, NavLink, useNavigate } from "react-router";
+import { useEffect, useMemo, useState } from "react";
+import { Outlet, NavLink, useLocation, useNavigate } from "react-router";
 import {
   LayoutDashboard,
   GitBranch,
@@ -16,6 +16,7 @@ import {
   Menu,
   X,
 } from "lucide-react";
+import { clearSession, getSession } from "../utils/walletSession";
 
 const navItems = [
   { path: "/app", label: "Dashboard", icon: LayoutDashboard, end: true },
@@ -27,11 +28,42 @@ const navItems = [
 
 export function Layout() {
   const navigate = useNavigate();
+  const location = useLocation();
   const [sidebarOpen, setSidebarOpen] = useState(true);
   const [searchVal, setSearchVal] = useState("");
   const [alertCount] = useState(3);
+  const [sessionLoaded, setSessionLoaded] = useState(false);
+  const [sessionName, setSessionName] = useState("Admin User");
+  const [sessionSubline, setSessionSubline] = useState("analyst@cryptoflow.io");
 
-  const handleLogout = () => navigate("/");
+  useEffect(() => {
+    const session = getSession();
+    if (!session) {
+      navigate("/");
+      return;
+    }
+
+    if (session.authType === "wallet" && session.walletAddress) {
+      const shortAddress = `${session.walletAddress.slice(0, 8)}...${session.walletAddress.slice(-6)}`;
+      setSessionName("Wallet Analyst");
+      setSessionSubline(shortAddress);
+    } else {
+      setSessionName("Admin User");
+      setSessionSubline(session.email ?? "analyst@cryptoflow.io");
+    }
+    setSessionLoaded(true);
+  }, [navigate]);
+
+  const profileLetter = useMemo(() => {
+    return sessionName.trim().charAt(0).toUpperCase() || "U";
+  }, [sessionName]);
+
+  const handleLogout = () => {
+    clearSession();
+    navigate("/");
+  };
+
+  if (!sessionLoaded) return null;
 
   return (
     <div
@@ -162,15 +194,16 @@ export function Layout() {
             </div>
           )}
           <button
+            onClick={() => navigate("/app/settings")}
             style={{
               display: "flex",
               alignItems: "center",
               gap: 10,
               padding: "10px 12px",
               borderRadius: 8,
-              background: "none",
-              border: "1px solid transparent",
-              color: "#7a9cc0",
+              background: location.pathname === "/app/settings" ? "rgba(0, 170, 255, 0.12)" : "none",
+              border: location.pathname === "/app/settings" ? "1px solid rgba(0, 170, 255, 0.3)" : "1px solid transparent",
+              color: location.pathname === "/app/settings" ? "#b8e6ff" : "#7a9cc0",
               cursor: "pointer",
               fontSize: 13,
               fontWeight: 500,
@@ -214,9 +247,9 @@ export function Layout() {
               <>
                 <div style={{ flex: 1, minWidth: 0 }}>
                   <div style={{ color: "#e2f0ff", fontSize: 12, fontWeight: 600, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>
-                    Admin User
+                    {sessionName}
                   </div>
-                  <div style={{ color: "#5b7fa6", fontSize: 10, whiteSpace: "nowrap" }}>analyst@cryptoflow.io</div>
+                  <div style={{ color: "#5b7fa6", fontSize: 10, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{sessionSubline}</div>
                 </div>
                 <button
                   onClick={handleLogout}
@@ -324,6 +357,7 @@ export function Layout() {
 
             {/* Profile */}
             <div
+              onClick={() => navigate("/app/profile")}
               style={{
                 width: 36,
                 height: 36,
@@ -335,8 +369,9 @@ export function Layout() {
                 justifyContent: "center",
                 cursor: "pointer",
               }}
+              title="Open wallet profile"
             >
-              <User size={16} color="#e2f0ff" />
+              <span style={{ color: "#e2f0ff", fontSize: 13, fontWeight: 700 }}>{profileLetter}</span>
             </div>
           </div>
         </header>

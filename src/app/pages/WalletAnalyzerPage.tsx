@@ -19,6 +19,17 @@ import jsPDF from "jspdf";
 import emailjs from "@emailjs/browser";
 import { analyzeWallet, predictAllAiFeatures, type WalletAnalysisResponse, type FlowTransaction, type MlAllFeaturesResponse } from "../api/walletAnalyzerApi";
 import { getRiskColor, getRiskLabel, formatAddress, timeAgo } from "../data/mockData";
+import { getSession, setWalletSession } from "../utils/walletSession";
+
+type EthereumProvider = {
+  request: (args: { method: string; params?: unknown[] | object }) => Promise<unknown>;
+};
+
+declare global {
+  interface Window {
+    ethereum?: EthereumProvider;
+  }
+}
 
 interface Counterparty {
   address: string;
@@ -366,6 +377,8 @@ const ChartTooltip = ({ active, payload, label }: { active?: boolean; payload?: 
 
 export function WalletAnalyzerPage() {
   const [query, setQuery] = useState("");
+  const [connectedWallet, setConnectedWallet] = useState<string | null>(null);
+  const [walletConnectStatus, setWalletConnectStatus] = useState<string | null>(null);
   const [analyzing, setAnalyzing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [emailStatus, setEmailStatus] = useState<string | null>(null);
@@ -375,11 +388,20 @@ export function WalletAnalyzerPage() {
   const [detailTab, setDetailTab] = useState<"overview" | "threat">("overview");
   const [expandedIntelAddress, setExpandedIntelAddress] = useState<string | null>(null);
   const emailedAlertsRef = useRef<Set<string>>(new Set());
+  const autoAnalyzedWalletRef = useRef<string | null>(null);
 
   useEffect(() => {
     setDetailTab("overview");
     setExpandedIntelAddress(null);
   }, [analysis?.wallet_address]);
+
+  useEffect(() => {
+    const session = getSession();
+    if (!session?.walletAddress) return;
+    const walletAddress = session.walletAddress;
+    setConnectedWallet(walletAddress);
+    setQuery((existing) => existing || walletAddress);
+  }, []);
 
   const getEscalationLevel = (score: number): "HIGH" | "MEDIUM" | "LOW" => {
     if (score >= 70) return "HIGH";
@@ -550,8 +572,10 @@ export function WalletAnalyzerPage() {
     }
   };
 
-  const executeAnalysis = async () => {
-    const walletAddress = query.trim();
+  const runAnalysis = async (walletAddress: string) => {
+    const targetWallet = walletAddress.trim();
+    if (!targetWallet) return;
+
     if (!walletAddress) return;
 
     setAnalyzing(true);
@@ -559,10 +583,10 @@ export function WalletAnalyzerPage() {
     setEmailStatus(null);
 
     try {
-      const response = await analyzeWallet(walletAddress);
+      const response = await analyzeWallet(targetWallet);
       setAnalysis(response);
       try {
-        const ai = await predictAllAiFeatures(walletAddress);
+        const ai = await predictAllAiFeatures(targetWallet);
         setAiFeatures(ai);
       } catch {
         setAiFeatures(null);
@@ -574,6 +598,49 @@ export function WalletAnalyzerPage() {
       setErrorMessage(err instanceof Error ? err.message : "Unexpected error during wallet analysis.");
     } finally {
       setAnalyzing(false);
+    }
+  };
+
+  const executeAnalysis = async () => {
+    await runAnalysis(query.trim());
+  };
+
+  useEffect(() => {
+    if (!connectedWallet || analyzing) return;
+    const normalizedConnected = connectedWallet.toLowerCase();
+    if (autoAnalyzedWalletRef.current === normalizedConnected) return;
+    if (analysis?.wallet_address?.toLowerCase() === normalizedConnected) {
+      autoAnalyzedWalletRef.current = normalizedConnected;
+      return;
+    }
+
+    autoAnalyzedWalletRef.current = normalizedConnected;
+    setQuery(connectedWallet);
+    void runAnalysis(connectedWallet);
+  }, [analysis?.wallet_address, analyzing, connectedWallet]);
+
+  const connectMetaMaskWallet = async () => {
+    if (!window.ethereum) {
+      setWalletConnectStatus("MetaMask is not detected. Install MetaMask and try again.");
+      return;
+    }
+
+    try {
+      setWalletConnectStatus("Connecting wallet...");
+      const accounts = (await window.ethereum.request({ method: "eth_requestAccounts" })) as string[];
+      const walletAddress = accounts?.[0];
+      if (!walletAddress) {
+        setWalletConnectStatus("MetaMask did not return an account.");
+        return;
+      }
+
+      setWalletSession(walletAddress);
+      setConnectedWallet(walletAddress);
+      setQuery(walletAddress);
+      setWalletConnectStatus(`Connected ${formatAddress(walletAddress)}. Starting analysis...`);
+      await runAnalysis(walletAddress);
+    } catch {
+      setWalletConnectStatus("Wallet connection request was rejected or failed.");
     }
   };
 
@@ -643,6 +710,72 @@ export function WalletAnalyzerPage() {
   const totalVolumeEth = useMemo(() => {
     return transactions.reduce((sum, tx) => sum + tx.value_eth, 0);
   }, [transactions]);
+
+  const walletProfileTrends = useMemo(() => {
+    if (!analysis) return null;
+
+    const dayMs = 24 * 60 * 60 * 1000;
+    const now = Date.now();
+    const recentStart = now - dayMs;
+    const previousStart = now - dayMs * 2;
+    const me = analysis.wallet_address.toLowerCase();
+
+    let recentVolume = 0;
+    let previousVolume = 0;
+    let recentTotal = 0;
+    let previousTotal = 0;
+    let recentSuspicious = 0;
+    let previousSuspicious = 0;
+
+    const recentCounterparties = new Set<string>();
+    const previousCounterparties = new Set<string>();
+
+    for (const tx of analysis.transaction_flow) {
+      const timestamp = Date.parse(tx.timestamp);
+      if (Number.isNaN(timestamp)) continue;
+
+      const from = tx.from.toLowerCase();
+      const other = from === me ? tx.to.toLowerCase() : tx.from.toLowerCase();
+
+      if (timestamp >= recentStart && timestamp <= now) {
+        recentVolume += tx.value_eth;
+        recentTotal += 1;
+        recentCounterparties.add(other);
+        if (suspiciousHashes.has(tx.hash)) recentSuspicious += 1;
+      } else if (timestamp >= previousStart && timestamp < recentStart) {
+        previousVolume += tx.value_eth;
+        previousTotal += 1;
+        previousCounterparties.add(other);
+        if (suspiciousHashes.has(tx.hash)) previousSuspicious += 1;
+      }
+    }
+
+    const newCounterparties = [...recentCounterparties].filter((cp) => !previousCounterparties.has(cp)).length;
+
+    const volumeDeltaPct = previousVolume > 0
+      ? ((recentVolume - previousVolume) / previousVolume) * 100
+      : recentVolume > 0
+      ? null
+      : 0;
+
+    const recentSuspiciousRatio = recentTotal > 0 ? recentSuspicious / recentTotal : 0;
+    const previousSuspiciousRatio = previousTotal > 0 ? previousSuspicious / previousTotal : 0;
+    const riskDrift = previousTotal > 0 || recentTotal > 0
+      ? (recentSuspiciousRatio - previousSuspiciousRatio) * 100
+      : null;
+
+    return {
+      recentVolume,
+      previousVolume,
+      volumeDeltaPct,
+      newCounterparties,
+      recentSuspiciousRatio,
+      previousSuspiciousRatio,
+      riskDrift,
+    };
+  }, [analysis, suspiciousHashes]);
+
+  const formatSigned = (value: number, digits = 1) => `${value >= 0 ? "+" : ""}${value.toFixed(digits)}`;
 
   const firstSeen = transactions.at(-1)?.timestamp;
   const lastSeen = transactions.at(0)?.timestamp;
@@ -917,6 +1050,11 @@ export function WalletAnalyzerPage() {
         <p style={{ color: "#5b7fa6", fontSize: 13, margin: "4px 0 0" }}>
           Live Ethereum wallet analysis powered by backend risk heuristics
         </p>
+        {connectedWallet && (
+          <div style={{ marginTop: 10, color: "#84d6a3", fontSize: 12 }}>
+            Connected wallet session: {connectedWallet}
+          </div>
+        )}
       </div>
 
       <div
@@ -931,7 +1069,7 @@ export function WalletAnalyzerPage() {
         <div style={{ color: "#7a9cc0", fontSize: 11, letterSpacing: "0.05em", marginBottom: 8 }}>
           ETHEREUM WALLET ADDRESS
         </div>
-        <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ display: "flex", gap: 10, flexWrap: "wrap" }}>
           <div style={{ flex: 1, position: "relative" }}>
             <Search
               size={14}
@@ -984,8 +1122,44 @@ export function WalletAnalyzerPage() {
           >
             {analyzing ? "ANALYZING..." : "ANALYZE"}
           </button>
+          <button
+            onClick={() => {
+              void connectMetaMaskWallet();
+            }}
+            disabled={analyzing}
+            style={{
+              padding: "12px 16px",
+              background: "transparent",
+              border: "1px solid #f6851b66",
+              borderRadius: 8,
+              color: "#f9b778",
+              fontSize: 12,
+              fontWeight: 700,
+              cursor: analyzing ? "not-allowed" : "pointer",
+              letterSpacing: "0.05em",
+              fontFamily: "'Space Grotesk', sans-serif",
+            }}
+          >
+            CONNECT METAMASK
+          </button>
         </div>
       </div>
+
+      {walletConnectStatus && (
+        <div
+          style={{
+            background: walletConnectStatus.toLowerCase().includes("connected") ? "rgba(0,255,157,0.08)" : "rgba(255,179,71,0.12)",
+            border: walletConnectStatus.toLowerCase().includes("connected") ? "1px solid rgba(0,255,157,0.3)" : "1px solid rgba(255,179,71,0.35)",
+            borderRadius: 10,
+            padding: "11px 14px",
+            color: walletConnectStatus.toLowerCase().includes("connected") ? "#84d6a3" : "#ffd28a",
+            fontSize: 12,
+            marginBottom: 20,
+          }}
+        >
+          {walletConnectStatus}
+        </div>
+      )}
 
       {errorMessage && (
         <div
@@ -1083,6 +1257,53 @@ export function WalletAnalyzerPage() {
                     />
                   </div>
                 </div>
+
+                {walletProfileTrends && (
+                  <div style={{ marginBottom: 14, background: "#050912", border: "1px solid #0f1e35", borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ color: "#7a9cc0", fontSize: 10, letterSpacing: "0.05em", marginBottom: 8 }}>WALLET PROFILE TRENDS (24H)</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10 }}>
+                      <div>
+                        <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 3 }}>Volume</div>
+                        <div style={{ color: "#d7e7f8", fontSize: 12, fontWeight: 700 }}>{walletProfileTrends.recentVolume.toFixed(4)} ETH</div>
+                        <div style={{ color: "#89afcf", fontSize: 10, display: "flex", alignItems: "center", gap: 4 }}>
+                          {walletProfileTrends.volumeDeltaPct === null ? (
+                            <span>new activity window</span>
+                          ) : walletProfileTrends.volumeDeltaPct >= 0 ? (
+                            <>
+                              <ArrowUpRight size={11} color="#f5a35b" />
+                              <span>{formatSigned(walletProfileTrends.volumeDeltaPct)}% vs prev 24h</span>
+                            </>
+                          ) : (
+                            <>
+                              <ArrowDownLeft size={11} color="#84d6a3" />
+                              <span>{formatSigned(walletProfileTrends.volumeDeltaPct)}% vs prev 24h</span>
+                            </>
+                          )}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 3 }}>New Counterparties</div>
+                        <div style={{ color: "#d7e7f8", fontSize: 12, fontWeight: 700 }}>{walletProfileTrends.newCounterparties}</div>
+                        <div style={{ color: walletProfileTrends.newCounterparties > 0 ? "#f5a35b" : "#84d6a3", fontSize: 10 }}>
+                          {walletProfileTrends.newCounterparties > 0 ? "fresh entities detected" : "stable network set"}
+                        </div>
+                      </div>
+
+                      <div>
+                        <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 3 }}>Risk Drift</div>
+                        <div style={{ color: "#d7e7f8", fontSize: 12, fontWeight: 700 }}>
+                          {walletProfileTrends.riskDrift === null ? "N/A" : `${formatSigned(walletProfileTrends.riskDrift)} pts`}
+                        </div>
+                        <div style={{ color: "#89afcf", fontSize: 10 }}>
+                          {walletProfileTrends.riskDrift === null
+                            ? "insufficient baseline"
+                            : `${(walletProfileTrends.recentSuspiciousRatio * 100).toFixed(1)}% suspicious now vs ${(walletProfileTrends.previousSuspiciousRatio * 100).toFixed(1)}%`}
+                        </div>
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {analysis.explainability && (
                   <div style={{ marginBottom: 14, background: "#050912", border: "1px solid #0f1e35", borderRadius: 8, padding: "10px 12px" }}>
