@@ -25,5 +25,4 @@ dist-ssr
 
 # Python artifacts
 backend/__pycache__/
-backend/models/*.joblib
 data/external/
