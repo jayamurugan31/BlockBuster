@@ -169,7 +169,14 @@ def _calculate_risk_score(df: pd.DataFrame, suspicious: list[dict]) -> int:
 
     # Proportion of suspicious transactions
     sus_ratio = len(suspicious) / total
-    score += sus_ratio * 40  # up to 40 points
+    score += sus_ratio * 55  # up to 55 points
+    if sus_ratio >= 0.5:
+        score += 15
+    elif sus_ratio >= 0.3:
+        score += 8
+
+    if len(suspicious) >= 5:
+        score += 10
 
     # Mixer / dark-web involvement → immediate high score
     mixer_addresses = KNOWN_MIXERS | KNOWN_DARKWEB
@@ -179,10 +186,23 @@ def _calculate_risk_score(df: pd.DataFrame, suspicious: list[dict]) -> int:
 
     # Large volume
     total_eth = df["value_eth"].sum()
-    if total_eth > 100:
-        score += 15
+    if total_eth > 1000:
+        score += 20
+    elif total_eth > 100:
+        score += 12
     elif total_eth > 10:
-        score += 8
+        score += 6
+
+    # Single-transfer outlier detection (important for scam drain patterns)
+    max_tx_eth = float(df["value_eth"].max()) if total else 0.0
+    if max_tx_eth > 10_000:
+        score += 25
+    elif max_tx_eth > 1_000:
+        score += 18
+    elif max_tx_eth > 100:
+        score += 12
+    elif max_tx_eth > 10:
+        score += 6
 
     # High tx count in short time
     if total > 0:
@@ -191,6 +211,22 @@ def _calculate_risk_score(df: pd.DataFrame, suspicious: list[dict]) -> int:
             rate = total / (timespan / 3600)  # txs per hour
             if rate > 60:
                 score += 10
+            elif rate > 20:
+                score += 5
+
+    # Boost when suspicious reasons indicate structural laundering patterns.
+    all_reasons = " ".join(
+        reason.lower()
+        for tx in suspicious
+        for reason in tx.get("reasons", [])
+        if isinstance(reason, str)
+    )
+    if "circular transaction pattern" in all_reasons:
+        score += 8
+    if "rapid transaction burst" in all_reasons:
+        score += 8
+    if "failed transaction with non-zero value" in all_reasons:
+        score += 5
 
     return min(100, round(score))
 
