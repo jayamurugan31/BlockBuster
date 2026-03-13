@@ -40,12 +40,11 @@ _RESULT_CACHE_TTL_SECONDS = 60.0
 _RESULT_CACHE_MAX_ENTRIES = 256
 
 
-def _default_dataset_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "data" / "transaction_dataset.csv"
-
-
-def _default_artifact_dir() -> Path:
-    return Path(__file__).resolve().parent / "models"
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not str(value).strip():
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return str(value).strip()
 
 
 def _default_download_dir() -> Path:
@@ -157,8 +156,8 @@ def train_all_models(
     fetch_external: bool = True,
     random_state: int = 42,
 ) -> dict[str, Any]:
-    ds_path = Path(dataset_path or os.environ.get("TRANSACTION_DATASET_PATH", _default_dataset_path()))
-    model_dir = Path(artifact_dir or os.environ.get("WALLET_ML_MODEL_DIR", _default_artifact_dir()))
+    ds_path = Path(dataset_path or _require_env("TRANSACTION_DATASET_PATH"))
+    model_dir = Path(artifact_dir or _require_env("WALLET_ML_MODEL_DIR"))
     download_dir = _default_download_dir()
 
     if not ds_path.exists():
@@ -329,7 +328,7 @@ def train_all_models(
 
 
 def _read_wallet_row(wallet_address: str, dataset_path: str | None = None) -> dict[str, Any]:
-    ds_path = Path(dataset_path or os.environ.get("TRANSACTION_DATASET_PATH", _default_dataset_path()))
+    ds_path = Path(dataset_path or _require_env("TRANSACTION_DATASET_PATH"))
     if not ds_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {ds_path}")
 
@@ -420,7 +419,7 @@ def predict_all_models_for_wallets(
     dataset_path: str | None = None,
     artifact_dir: str | None = None,
 ) -> list[dict[str, Any]]:
-    ds_path = Path(dataset_path or os.environ.get("TRANSACTION_DATASET_PATH", _default_dataset_path()))
+    ds_path = Path(dataset_path or _require_env("TRANSACTION_DATASET_PATH"))
     if not ds_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {ds_path}")
 
@@ -433,7 +432,7 @@ def predict_all_models_for_wallets(
     if not wanted:
         return []
 
-    model_dir = Path(artifact_dir or os.environ.get("WALLET_ML_MODEL_DIR", _default_artifact_dir()))
+    model_dir = Path(artifact_dir or _require_env("WALLET_ML_MODEL_DIR"))
     model_paths = [model_dir / name for name in MODEL_FILES.values()]
     for path in model_paths:
         if not path.exists():

@@ -24,12 +24,11 @@ class ModelNotTrainedError(RuntimeError):
     """Raised when a prediction is requested before model training."""
 
 
-def _default_dataset_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "data" / "transaction_dataset.csv"
-
-
-def _default_model_path() -> Path:
-    return Path(__file__).resolve().parent / "models" / "wallet_risk_model.joblib"
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not str(value).strip():
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return str(value).strip()
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -81,8 +80,8 @@ def train_wallet_risk_model(
     random_state: int = 42,
 ) -> dict[str, Any]:
     """Train a wallet-risk classifier and persist the model bundle to disk."""
-    ds_path = Path(dataset_path or os.environ.get("TRANSACTION_DATASET_PATH", _default_dataset_path()))
-    out_path = Path(model_path or os.environ.get("WALLET_ML_MODEL_PATH", _default_model_path()))
+    ds_path = Path(dataset_path or _require_env("TRANSACTION_DATASET_PATH"))
+    out_path = Path(model_path or _require_env("WALLET_ML_MODEL_PATH"))
 
     if not ds_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {ds_path}")
@@ -164,7 +163,7 @@ def train_wallet_risk_model(
 
 
 def load_model_bundle(model_path: str | None = None) -> dict[str, Any]:
-    path = Path(model_path or os.environ.get("WALLET_ML_MODEL_PATH", _default_model_path()))
+    path = Path(model_path or _require_env("WALLET_ML_MODEL_PATH"))
     if not path.exists():
         raise ModelNotTrainedError(
             f"Model file not found at {path}. Train the model first via /api/ml/train."
@@ -211,7 +210,7 @@ def _get_address_column(columns: list[str]) -> str:
 
 
 def _get_wallet_row_features(wallet_address: str, dataset_path: str | None = None) -> dict[str, Any]:
-    ds_path = Path(dataset_path or os.environ.get("TRANSACTION_DATASET_PATH", _default_dataset_path()))
+    ds_path = Path(dataset_path or _require_env("TRANSACTION_DATASET_PATH"))
     if not ds_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {ds_path}")
 

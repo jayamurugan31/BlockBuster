@@ -13,8 +13,11 @@ import pandas as pd
 _ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 
 
-def _default_dataset_path() -> Path:
-    return Path(__file__).resolve().parent.parent / "data" / "transaction_dataset.csv"
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not str(value).strip():
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return str(value).strip()
 
 
 def _clamp(value: float, low: int = 0, high: int = 100) -> int:
@@ -57,9 +60,9 @@ def _wallet_type(risk: int, tx_count: int) -> str:
 
 def build_analytics_dataset() -> dict:
     """Build a complete analytics payload from a wallet-level CSV dataset."""
-    dataset_path = Path(os.environ.get("TRANSACTION_DATASET_PATH", _default_dataset_path()))
-    sample_size = max(20, int(os.environ.get("ANALYTICS_SAMPLE_SIZE", "140")))
-    eth_usd_price = max(500.0, _as_float(os.environ.get("ETH_USD_PRICE", "3500"), 3500.0))
+    dataset_path = Path(_require_env("TRANSACTION_DATASET_PATH"))
+    sample_size = max(20, int(_require_env("ANALYTICS_SAMPLE_SIZE")))
+    eth_usd_price = max(500.0, _as_float(_require_env("ETH_USD_PRICE"), 3500.0))
 
     if not dataset_path.exists():
         raise FileNotFoundError(

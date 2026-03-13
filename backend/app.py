@@ -32,9 +32,16 @@ app = Flask(__name__)
 #   CORS(app, origins=["https://yourapp.example.com"])
 CORS(app, origins="*")
 
-ETHERSCAN_API_KEY = os.environ.get("ETHERSCAN_API_KEY", "")
-ETHERSCAN_BASE_URL = "https://api.etherscan.io/v2/api"
-ETHERSCAN_CHAIN_ID = (os.environ.get("ETHERSCAN_CHAIN_ID", "1") or "1").strip()
+def _require_env(name: str) -> str:
+    value = os.environ.get(name)
+    if value is None or not str(value).strip():
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return str(value).strip()
+
+
+ETHERSCAN_API_KEY = _require_env("ETHERSCAN_API_KEY")
+ETHERSCAN_BASE_URL = _require_env("ETHERSCAN_BASE_URL")
+ETHERSCAN_CHAIN_ID = _require_env("ETHERSCAN_CHAIN_ID")
 
 # Basic Ethereum address pattern (0x followed by 40 hex chars)
 _ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
@@ -251,7 +258,7 @@ def ml_predict():
 
 @app.route("/api/ml/status", methods=["GET"])
 def ml_status():
-    model_path = os.environ.get("WALLET_ML_MODEL_PATH", os.path.join(BACKEND_DIR, "models", "wallet_risk_model.joblib"))
+    model_path = _require_env("WALLET_ML_MODEL_PATH")
     return jsonify({
         "model_path": model_path,
         "model_available": os.path.exists(model_path),
@@ -288,7 +295,7 @@ def ml_train_all():
 
 @app.route("/api/ml/models", methods=["GET"])
 def ml_models_status():
-    model_dir = os.environ.get("WALLET_ML_MODEL_DIR", os.path.join(BACKEND_DIR, "models"))
+    model_dir = _require_env("WALLET_ML_MODEL_DIR")
     payload = []
     for _, name in MODEL_FILES.items():
         path = os.path.join(model_dir, name)
@@ -489,6 +496,6 @@ def _fetch_transactions(address: str) -> tuple[list[dict], str | None]:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    debug = os.environ.get("FLASK_DEBUG", "false").lower() == "true"
+    port = int(_require_env("PORT"))
+    debug = _require_env("FLASK_DEBUG").lower() == "true"
     app.run(host="0.0.0.0", port=port, debug=debug)

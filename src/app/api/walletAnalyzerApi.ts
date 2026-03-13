@@ -90,11 +90,12 @@ export interface MlTrainResponse {
   metrics: MlTrainMetrics;
 }
 
-const DEFAULT_API_BASE_URL = "http://localhost:5000";
-
 function getApiBaseUrl(): string {
-  const configured = import.meta.env.VITE_API_BASE_URL;
-  return (configured ?? DEFAULT_API_BASE_URL).replace(/\/$/, "");
+  const configured = import.meta.env.VITE_API_BASE_URL?.trim();
+  if (!configured) {
+    throw new Error("Missing VITE_API_BASE_URL. Set it in your frontend environment variables.");
+  }
+  return configured.replace(/\/$/, "");
 }
 
 function buildErrorMessage(status: number, payload: unknown): string {
