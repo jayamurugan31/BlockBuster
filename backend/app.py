@@ -10,6 +10,7 @@ from flask_cors import CORS
 from dotenv import load_dotenv
 
 from analytics_data import build_analytics_dataset
+from ml_model import ModelNotTrainedError, predict_from_features, predict_from_wallet_address, train_wallet_risk_model
 from wallet_analyzer import analyze_transactions
 
 # ---------------------------------------------------------------------------
@@ -45,6 +46,29 @@ _ETH_ADDRESS_RE = re.compile(r"^0x[0-9a-fA-F]{40}$")
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status": "ok", "service": "CryptoFlow Analyzer"}), 200
+
+
+@app.route("/", methods=["GET"])
+def index():
+    return jsonify({
+        "service": "CryptoFlow Analyzer",
+        "status": "running",
+        "endpoints": [
+            "/health",
+            "/api/analytics",
+            "/api/suspicious",
+            "/api/alerts",
+            "/analyze_wallet",
+            "/api/ml/status",
+            "/api/ml/train",
+            "/api/ml/predict",
+        ],
+    }), 200
+
+
+@app.route("/favicon.ico", methods=["GET"])
+def favicon():
+    return "", 204
 
 
 @app.route("/api/analytics", methods=["GET"])
@@ -115,6 +139,94 @@ def alerts_feed():
         alerts = [a for a in alerts if str(a.get("severity", "")).lower() == severity]
 
     return jsonify({"count": len(alerts), "items": alerts}), 200
+
+
+@app.route("/api/ml/train", methods=["POST"])
+def train_ml_model():
+    """
+    POST /api/ml/train
+    Optional JSON body:
+    {
+      "test_size": 0.2,
+      "random_state": 42,
+      "dataset_path": "...",
+      "model_path": "..."
+    }
+    """
+    body = request.get_json(silent=True) or {}
+
+    test_size = body.get("test_size", 0.2)
+    random_state = body.get("random_state", 42)
+    dataset_path = body.get("dataset_path")
+    model_path = body.get("model_path")
+
+    try:
+        metrics = train_wallet_risk_model(
+            dataset_path=dataset_path,
+            model_path=model_path,
+            test_size=float(test_size),
+            random_state=int(random_state),
+        )
+        return jsonify({"message": "Model trained successfully", "metrics": metrics}), 200
+    except (FileNotFoundError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Model training failed: {exc}"}), 500
+
+
+@app.route("/api/ml/predict", methods=["POST"])
+def ml_predict():
+    """
+    POST /api/ml/predict
+    Body supports either:
+    {
+      "wallet_address": "0x..."
+    }
+    or
+    {
+      "features": {"Sent tnx": 10, "Received Tnx": 12, ...}
+    }
+    """
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    wallet_address = (body.get("wallet_address") or "").strip()
+    features = body.get("features")
+    dataset_path = body.get("dataset_path")
+    model_path = body.get("model_path")
+
+    try:
+        if wallet_address:
+            if not _ETH_ADDRESS_RE.match(wallet_address):
+                return jsonify({"error": "Invalid Ethereum wallet address format"}), 400
+            result = predict_from_wallet_address(
+                wallet_address=wallet_address,
+                model_path=model_path,
+                dataset_path=dataset_path,
+            )
+            return jsonify(result), 200
+
+        if isinstance(features, dict):
+            result = predict_from_features(features=features, model_path=model_path)
+            return jsonify(result), 200
+
+        return jsonify({"error": "Provide either wallet_address or features in request body"}), 400
+    except ModelNotTrainedError as exc:
+        return jsonify({"error": str(exc)}), 409
+    except (FileNotFoundError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Prediction failed: {exc}"}), 500
+
+
+@app.route("/api/ml/status", methods=["GET"])
+def ml_status():
+    model_path = os.environ.get("WALLET_ML_MODEL_PATH", os.path.join(BACKEND_DIR, "models", "wallet_risk_model.joblib"))
+    return jsonify({
+        "model_path": model_path,
+        "model_available": os.path.exists(model_path),
+    }), 200
 
 
 @app.route("/analyze_wallet", methods=["POST"])

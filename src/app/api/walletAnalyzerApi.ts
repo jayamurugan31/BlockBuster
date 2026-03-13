@@ -24,6 +24,36 @@ export interface WalletAnalysisResponse {
   transaction_flow: FlowTransaction[];
 }
 
+export interface MlStatusResponse {
+  model_path: string;
+  model_available: boolean;
+}
+
+export interface MlPredictionResponse {
+  wallet_address?: string;
+  prediction: number;
+  risk_probability: number;
+  risk_score: number;
+  used_features: string[];
+}
+
+export interface MlTrainMetrics {
+  model_path: string;
+  dataset_path: string;
+  rows: number;
+  features: number;
+  accuracy: number;
+  precision: number;
+  recall: number;
+  f1: number;
+  roc_auc: number | null;
+}
+
+export interface MlTrainResponse {
+  message: string;
+  metrics: MlTrainMetrics;
+}
+
 const DEFAULT_API_BASE_URL = "http://localhost:5000";
 
 function getApiBaseUrl(): string {
@@ -61,4 +91,56 @@ export async function analyzeWallet(walletAddress: string): Promise<WalletAnalys
   }
 
   return payload as WalletAnalysisResponse;
+}
+
+export async function getMlModelStatus(): Promise<MlStatusResponse> {
+  const response = await fetch(`${getApiBaseUrl()}/api/ml/status`);
+  const payload = (await response.json().catch(() => null)) as unknown;
+
+  if (!response.ok) {
+    throw new Error(buildErrorMessage(response.status, payload));
+  }
+
+  return payload as MlStatusResponse;
+}
+
+export async function trainMlModel(options?: {
+  test_size?: number;
+  random_state?: number;
+  dataset_path?: string;
+  model_path?: string;
+}): Promise<MlTrainResponse> {
+  const response = await fetch(`${getApiBaseUrl()}/api/ml/train`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(options ?? {}),
+  });
+
+  const payload = (await response.json().catch(() => null)) as unknown;
+
+  if (!response.ok) {
+    throw new Error(buildErrorMessage(response.status, payload));
+  }
+
+  return payload as MlTrainResponse;
+}
+
+export async function predictWalletRisk(walletAddress: string): Promise<MlPredictionResponse> {
+  const response = await fetch(`${getApiBaseUrl()}/api/ml/predict`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ wallet_address: walletAddress }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as unknown;
+
+  if (!response.ok) {
+    throw new Error(buildErrorMessage(response.status, payload));
+  }
+
+  return payload as MlPredictionResponse;
 }
