@@ -37,6 +37,42 @@ export interface MlPredictionResponse {
   used_features: string[];
 }
 
+export interface MlAllFeaturesResponse {
+  wallet_address: string;
+  models: {
+    wallet_risk_classifier?: {
+      prediction: number;
+      risk_probability: number;
+      risk_score: number;
+    };
+    transaction_anomaly_detector?: {
+      is_anomaly: boolean;
+      raw_label: number;
+      anomaly_score: number;
+    };
+    counterparty_contagion_regressor?: {
+      contagion_score: number;
+    };
+    behavior_shift_detector?: {
+      behavior_shift_detected: boolean;
+      raw_label: number;
+      shift_score: number;
+    };
+    entity_type_classifier?: {
+      entity_type: string;
+    };
+    alert_prioritizer?: {
+      priority_score: number;
+    };
+  };
+}
+
+export interface MlBatchPredictionResponse {
+  count: number;
+  results: MlAllFeaturesResponse[];
+  errors: Array<{ wallet_address: string; error: string }>;
+}
+
 export interface MlTrainMetrics {
   model_path: string;
   dataset_path: string;
@@ -143,4 +179,40 @@ export async function predictWalletRisk(walletAddress: string): Promise<MlPredic
   }
 
   return payload as MlPredictionResponse;
+}
+
+export async function predictAllAiFeatures(walletAddress: string): Promise<MlAllFeaturesResponse> {
+  const response = await fetch(`${getApiBaseUrl()}/api/ml/predict-all`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ wallet_address: walletAddress }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as unknown;
+
+  if (!response.ok) {
+    throw new Error(buildErrorMessage(response.status, payload));
+  }
+
+  return payload as MlAllFeaturesResponse;
+}
+
+export async function predictAllAiFeaturesBatch(walletAddresses: string[]): Promise<MlBatchPredictionResponse> {
+  const response = await fetch(`${getApiBaseUrl()}/api/ml/predict-batch`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({ wallet_addresses: walletAddresses }),
+  });
+
+  const payload = (await response.json().catch(() => null)) as unknown;
+
+  if (!response.ok) {
+    throw new Error(buildErrorMessage(response.status, payload));
+  }
+
+  return payload as MlBatchPredictionResponse;
 }

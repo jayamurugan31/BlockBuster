@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from analytics_data import build_analytics_dataset
 from fraud_model import ModelNotTrainedError, predict_from_features, predict_from_wallet_address, train_wallet_risk_model
-from multi_model_trainer import train_all_models
+from multi_model_trainer import MODEL_FILES, predict_all_models_for_wallet, train_all_models
 from wallet_analyzer import analyze_transactions
 
 # ---------------------------------------------------------------------------
@@ -65,6 +65,7 @@ def index():
             "/api/ml/predict",
             "/api/ml/train-all",
             "/api/ml/models",
+            "/api/ml/predict-all",
         ],
     }), 200
 
@@ -89,8 +90,28 @@ def analytics():
       hourlyAlerts: [...]
     }
     """
+    include_ai = (request.args.get("include_ai", "false") or "false").strip().lower() in {"1", "true", "yes"}
+
     try:
         payload = build_analytics_dataset()
+        if include_ai:
+            model_errors = []
+            insights = {}
+            for node in payload.get("walletNodes", []):
+                address = str(node.get("address", "")).strip().lower()
+                if not address:
+                    continue
+                try:
+                    insights[address] = predict_all_models_for_wallet(address)
+                except Exception as exc:
+                    model_errors.append({"address": address, "error": str(exc)})
+
+            payload["aiInsights"] = insights
+            payload["aiIntegration"] = {
+                "enabled": True,
+                "scored_wallets": len(insights),
+                "errors": model_errors,
+            }
         return jsonify(payload), 200
     except FileNotFoundError as exc:
         return jsonify({"error": str(exc)}), 500
@@ -263,16 +284,8 @@ def ml_train_all():
 @app.route("/api/ml/models", methods=["GET"])
 def ml_models_status():
     model_dir = os.environ.get("WALLET_ML_MODEL_DIR", os.path.join(BACKEND_DIR, "models"))
-    names = [
-        "wallet_risk_model.joblib",
-        "transaction_anomaly_model.joblib",
-        "counterparty_contagion_model.joblib",
-        "behavior_shift_model.joblib",
-        "entity_type_model.joblib",
-        "alert_prioritizer_model.joblib",
-    ]
     payload = []
-    for name in names:
+    for _, name in MODEL_FILES.items():
         path = os.path.join(model_dir, name)
         payload.append({
             "name": name,
@@ -280,6 +293,87 @@ def ml_models_status():
             "available": os.path.exists(path),
         })
     return jsonify({"model_dir": model_dir, "models": payload}), 200
+
+
+@app.route("/api/ml/predict-all", methods=["POST"])
+def ml_predict_all():
+    """
+    POST /api/ml/predict-all
+    Body:
+    {
+      "wallet_address": "0x...",
+      "dataset_path": "...",   # optional
+      "artifact_dir": "..."    # optional
+    }
+    """
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    wallet_address = (body.get("wallet_address") or "").strip()
+    if not wallet_address:
+        return jsonify({"error": "wallet_address is required"}), 400
+    if not _ETH_ADDRESS_RE.match(wallet_address):
+        return jsonify({"error": "Invalid Ethereum wallet address format"}), 400
+
+    try:
+        result = predict_all_models_for_wallet(
+            wallet_address=wallet_address,
+            dataset_path=body.get("dataset_path"),
+            artifact_dir=body.get("artifact_dir"),
+        )
+        return jsonify(result), 200
+    except (FileNotFoundError, ValueError) as exc:
+        return jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return jsonify({"error": f"Predict-all failed: {exc}"}), 500
+
+
+@app.route("/api/ml/predict-batch", methods=["POST"])
+def ml_predict_batch():
+    """
+    POST /api/ml/predict-batch
+    Body:
+    {
+      "wallet_addresses": ["0x...", "0x..."],
+      "dataset_path": "...",   # optional
+      "artifact_dir": "..."    # optional
+    }
+    """
+    body = request.get_json(silent=True)
+    if not body:
+        return jsonify({"error": "Request body must be JSON"}), 400
+
+    wallet_addresses = body.get("wallet_addresses")
+    if not isinstance(wallet_addresses, list) or not wallet_addresses:
+        return jsonify({"error": "wallet_addresses must be a non-empty array"}), 400
+
+    dataset_path = body.get("dataset_path")
+    artifact_dir = body.get("artifact_dir")
+
+    results = []
+    errors = []
+    for raw in wallet_addresses:
+        wallet_address = str(raw or "").strip()
+        if not _ETH_ADDRESS_RE.match(wallet_address):
+            errors.append({"wallet_address": wallet_address, "error": "Invalid Ethereum wallet address format"})
+            continue
+        try:
+            results.append(
+                predict_all_models_for_wallet(
+                    wallet_address=wallet_address,
+                    dataset_path=dataset_path,
+                    artifact_dir=artifact_dir,
+                )
+            )
+        except Exception as exc:
+            errors.append({"wallet_address": wallet_address, "error": str(exc)})
+
+    return jsonify({
+        "count": len(results),
+        "results": results,
+        "errors": errors,
+    }), 200
 
 
 @app.route("/analyze_wallet", methods=["POST"])
