@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +33,12 @@ MODEL_FILES = {
     "alert_prioritizer": "alert_prioritizer_model.joblib",
 }
 
+_DATAFRAME_CACHE: dict[str, tuple[float, pd.DataFrame]] = {}
+_BUNDLE_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+_RESULT_CACHE: dict[tuple[Any, ...], tuple[float, list[dict[str, Any]]]] = {}
+_RESULT_CACHE_TTL_SECONDS = 60.0
+_RESULT_CACHE_MAX_ENTRIES = 256
+
 
 def _default_dataset_path() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "transaction_dataset.csv"
@@ -43,6 +50,35 @@ def _default_artifact_dir() -> Path:
 
 def _default_download_dir() -> Path:
     return Path(__file__).resolve().parent.parent / "data" / "external"
+
+
+def _invalidate_caches() -> None:
+    _DATAFRAME_CACHE.clear()
+    _BUNDLE_CACHE.clear()
+    _RESULT_CACHE.clear()
+
+
+def _get_dataset_df(ds_path: Path) -> pd.DataFrame:
+    cache_key = str(ds_path.resolve())
+    mtime = ds_path.stat().st_mtime
+    cached = _DATAFRAME_CACHE.get(cache_key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    df = _normalize_columns(pd.read_csv(ds_path))
+    _DATAFRAME_CACHE[cache_key] = (mtime, df)
+    return df
+
+
+def _cleanup_result_cache(now: float) -> None:
+    expired = [k for k, (ts, _) in _RESULT_CACHE.items() if now - ts > _RESULT_CACHE_TTL_SECONDS]
+    for key in expired:
+        _RESULT_CACHE.pop(key, None)
+
+    if len(_RESULT_CACHE) > _RESULT_CACHE_MAX_ENTRIES:
+        oldest = sorted(_RESULT_CACHE.items(), key=lambda item: item[1][0])
+        for key, _ in oldest[: len(_RESULT_CACHE) - _RESULT_CACHE_MAX_ENTRIES]:
+            _RESULT_CACHE.pop(key, None)
 
 
 def _normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -286,6 +322,9 @@ def train_all_models(
         "r2": float(r2_score(y_test, alert_pred)),
     }
 
+    # Retraining changes both dataset usage and model artifacts.
+    _invalidate_caches()
+
     return summary
 
 
@@ -294,7 +333,7 @@ def _read_wallet_row(wallet_address: str, dataset_path: str | None = None) -> di
     if not ds_path.exists():
         raise FileNotFoundError(f"Dataset file not found: {ds_path}")
 
-    df = _normalize_columns(pd.read_csv(ds_path))
+    df = _get_dataset_df(ds_path)
     address_col = _find_col(list(df.columns), "address")
     if not address_col:
         raise ValueError("Dataset missing Address column.")
@@ -348,9 +387,16 @@ def _load_bundle(model_dir: Path, key: str) -> dict[str, Any]:
     if not path.exists():
         raise FileNotFoundError(f"Model artifact not found: {path}")
 
+    cache_key = str(path.resolve())
+    mtime = path.stat().st_mtime
+    cached = _BUNDLE_CACHE.get(cache_key)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
     bundle = joblib.load(path)
     if not isinstance(bundle, dict) or "model" not in bundle:
         raise ValueError(f"Invalid model bundle at {path}")
+    _BUNDLE_CACHE[cache_key] = (mtime, bundle)
     return bundle
 
 
@@ -359,81 +405,131 @@ def predict_all_models_for_wallet(
     dataset_path: str | None = None,
     artifact_dir: str | None = None,
 ) -> dict[str, Any]:
-    row = _read_wallet_row(wallet_address=wallet_address, dataset_path=dataset_path)
+    batch = predict_all_models_for_wallets(
+        wallet_addresses=[wallet_address],
+        dataset_path=dataset_path,
+        artifact_dir=artifact_dir,
+    )
+    if not batch:
+        raise ValueError(f"Wallet address {wallet_address.strip().lower()} not found in dataset.")
+    return batch[0]
+
+
+def predict_all_models_for_wallets(
+    wallet_addresses: list[str],
+    dataset_path: str | None = None,
+    artifact_dir: str | None = None,
+) -> list[dict[str, Any]]:
+    ds_path = Path(dataset_path or os.environ.get("TRANSACTION_DATASET_PATH", _default_dataset_path()))
+    if not ds_path.exists():
+        raise FileNotFoundError(f"Dataset file not found: {ds_path}")
+
+    df = _get_dataset_df(ds_path)
+    address_col = _find_col(list(df.columns), "address")
+    if not address_col:
+        raise ValueError("Dataset missing Address column.")
+
+    wanted = {str(addr).strip().lower() for addr in wallet_addresses if str(addr).strip()}
+    if not wanted:
+        return []
+
     model_dir = Path(artifact_dir or os.environ.get("WALLET_ML_MODEL_DIR", _default_artifact_dir()))
+    model_paths = [model_dir / name for name in MODEL_FILES.values()]
+    for path in model_paths:
+        if not path.exists():
+            raise FileNotFoundError(f"Model artifact not found: {path}")
 
-    out: dict[str, Any] = {
-        "wallet_address": wallet_address.strip().lower(),
-        "models": {},
-    }
+    dataset_mtime = ds_path.stat().st_mtime
+    model_mtimes = tuple((name, path.stat().st_mtime) for name, path in zip(MODEL_FILES.keys(), model_paths))
+    cache_key = (
+        str(ds_path.resolve()),
+        dataset_mtime,
+        str(model_dir.resolve()),
+        model_mtimes,
+        tuple(sorted(wanted)),
+    )
 
-    # Wallet risk classifier
-    risk_bundle = _load_bundle(model_dir, "wallet_risk_classifier")
-    risk_cols = risk_bundle.get("feature_columns", [])
-    X_risk = _row_to_numeric_features(row, risk_cols)
-    risk_model = risk_bundle["model"]
-    risk_pred = int(risk_model.predict(X_risk)[0])
-    risk_prob = float(risk_model.predict_proba(X_risk)[0][1]) if hasattr(risk_model, "predict_proba") else float(risk_pred)
-    out["models"]["wallet_risk_classifier"] = {
-        "prediction": risk_pred,
-        "risk_probability": round(risk_prob, 6),
-        "risk_score": round(risk_prob * 100, 2),
-    }
+    now = time.monotonic()
+    _cleanup_result_cache(now)
+    cached_result = _RESULT_CACHE.get(cache_key)
+    if cached_result and now - cached_result[0] <= _RESULT_CACHE_TTL_SECONDS:
+        return cached_result[1]
 
-    # Transaction anomaly detector
-    anomaly_bundle = _load_bundle(model_dir, "transaction_anomaly_detector")
-    anomaly_cols = anomaly_bundle.get("feature_columns", [])
-    X_an = _row_to_numeric_features(row, anomaly_cols)
-    anomaly_model = anomaly_bundle["model"]
-    anomaly_label = int(anomaly_model.predict(X_an)[0])
-    anomaly_score = float(anomaly_model.decision_function(X_an)[0]) if hasattr(anomaly_model, "decision_function") else float(anomaly_label)
-    out["models"]["transaction_anomaly_detector"] = {
-        "is_anomaly": anomaly_label == -1,
-        "raw_label": anomaly_label,
-        "anomaly_score": round(anomaly_score, 6),
-    }
+    matches = df[df[address_col].astype(str).str.lower().str.strip().isin(wanted)]
+    if matches.empty:
+        return []
 
-    # Counterparty contagion regressor
-    contagion_bundle = _load_bundle(model_dir, "counterparty_contagion_regressor")
-    contagion_cols = contagion_bundle.get("feature_columns", [])
-    X_cont = _row_to_numeric_features(row, contagion_cols)
-    contagion_model = contagion_bundle["model"]
-    contagion_score = float(contagion_model.predict(X_cont)[0])
-    out["models"]["counterparty_contagion_regressor"] = {
-        "contagion_score": round(max(0.0, min(100.0, contagion_score)), 4),
-    }
+    bundles = {key: _load_bundle(model_dir, key) for key in MODEL_FILES.keys()}
 
-    # Behavior shift detector
-    shift_bundle = _load_bundle(model_dir, "behavior_shift_detector")
-    shift_cols = shift_bundle.get("feature_columns", [])
-    X_shift = _row_to_numeric_features(row, shift_cols)
-    shift_model = shift_bundle["model"]
-    shift_label = int(shift_model.predict(X_shift)[0])
-    shift_score = float(shift_model.decision_function(X_shift)[0]) if hasattr(shift_model, "decision_function") else float(shift_label)
-    out["models"]["behavior_shift_detector"] = {
-        "behavior_shift_detected": shift_label == -1,
-        "raw_label": shift_label,
-        "shift_score": round(shift_score, 6),
-    }
+    outputs: list[dict[str, Any]] = []
+    for _, row_series in matches.iterrows():
+        wallet_address = str(row_series[address_col]).strip().lower()
+        row = row_series.to_dict()
+        row.pop(address_col, None)
 
-    # Entity type classifier
-    entity_bundle = _load_bundle(model_dir, "entity_type_classifier")
-    entity_cols = entity_bundle.get("feature_columns", [])
-    X_ent = _row_to_numeric_features(row, entity_cols)
-    entity_model = entity_bundle["model"]
-    entity_label = str(entity_model.predict(X_ent)[0])
-    out["models"]["entity_type_classifier"] = {
-        "entity_type": entity_label,
-    }
+        out: dict[str, Any] = {
+            "wallet_address": wallet_address,
+            "models": {},
+        }
 
-    # Alert prioritizer regressor
-    alert_bundle = _load_bundle(model_dir, "alert_prioritizer")
-    alert_cols = alert_bundle.get("feature_columns", [])
-    X_alert = _row_to_numeric_features(row, alert_cols)
-    alert_model = alert_bundle["model"]
-    alert_score = float(alert_model.predict(X_alert)[0])
-    out["models"]["alert_prioritizer"] = {
-        "priority_score": round(max(0.0, min(100.0, alert_score)), 4),
-    }
+        risk_bundle = bundles["wallet_risk_classifier"]
+        X_risk = _row_to_numeric_features(row, risk_bundle.get("feature_columns", []))
+        risk_model = risk_bundle["model"]
+        risk_pred = int(risk_model.predict(X_risk)[0])
+        risk_prob = float(risk_model.predict_proba(X_risk)[0][1]) if hasattr(risk_model, "predict_proba") else float(risk_pred)
+        out["models"]["wallet_risk_classifier"] = {
+            "prediction": risk_pred,
+            "risk_probability": round(risk_prob, 6),
+            "risk_score": round(risk_prob * 100, 2),
+        }
 
-    return out
+        anomaly_bundle = bundles["transaction_anomaly_detector"]
+        X_an = _row_to_numeric_features(row, anomaly_bundle.get("feature_columns", []))
+        anomaly_model = anomaly_bundle["model"]
+        anomaly_label = int(anomaly_model.predict(X_an)[0])
+        anomaly_score = float(anomaly_model.decision_function(X_an)[0]) if hasattr(anomaly_model, "decision_function") else float(anomaly_label)
+        out["models"]["transaction_anomaly_detector"] = {
+            "is_anomaly": anomaly_label == -1,
+            "raw_label": anomaly_label,
+            "anomaly_score": round(anomaly_score, 6),
+        }
+
+        contagion_bundle = bundles["counterparty_contagion_regressor"]
+        X_cont = _row_to_numeric_features(row, contagion_bundle.get("feature_columns", []))
+        contagion_model = contagion_bundle["model"]
+        contagion_score = float(contagion_model.predict(X_cont)[0])
+        out["models"]["counterparty_contagion_regressor"] = {
+            "contagion_score": round(max(0.0, min(100.0, contagion_score)), 4),
+        }
+
+        shift_bundle = bundles["behavior_shift_detector"]
+        X_shift = _row_to_numeric_features(row, shift_bundle.get("feature_columns", []))
+        shift_model = shift_bundle["model"]
+        shift_label = int(shift_model.predict(X_shift)[0])
+        shift_score = float(shift_model.decision_function(X_shift)[0]) if hasattr(shift_model, "decision_function") else float(shift_label)
+        out["models"]["behavior_shift_detector"] = {
+            "behavior_shift_detected": shift_label == -1,
+            "raw_label": shift_label,
+            "shift_score": round(shift_score, 6),
+        }
+
+        entity_bundle = bundles["entity_type_classifier"]
+        X_ent = _row_to_numeric_features(row, entity_bundle.get("feature_columns", []))
+        entity_model = entity_bundle["model"]
+        out["models"]["entity_type_classifier"] = {
+            "entity_type": str(entity_model.predict(X_ent)[0]),
+        }
+
+        alert_bundle = bundles["alert_prioritizer"]
+        X_alert = _row_to_numeric_features(row, alert_bundle.get("feature_columns", []))
+        alert_model = alert_bundle["model"]
+        alert_score = float(alert_model.predict(X_alert)[0])
+        out["models"]["alert_prioritizer"] = {
+            "priority_score": round(max(0.0, min(100.0, alert_score)), 4),
+        }
+
+        outputs.append(out)
+
+    _RESULT_CACHE[cache_key] = (now, outputs)
+    _cleanup_result_cache(now)
+    return outputs

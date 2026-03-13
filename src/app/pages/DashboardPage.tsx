@@ -28,7 +28,7 @@ import {
   formatAddress,
   timeAgo,
 } from "../data/mockData";
-import { useAnalyticsData } from "../hooks/useAnalyticsData";
+import { useAnalyticsDataWithAi } from "../hooks/useAnalyticsData";
 
 const S = {
   page: {
@@ -157,7 +157,7 @@ const CustomTooltip = ({ active, payload, label }: any) => {
 };
 
 export function DashboardPage() {
-  const { data } = useAnalyticsData();
+  const { data } = useAnalyticsDataWithAi();
   const { walletNodes, transactions, alerts, volumeData, riskDistData } = data;
   const [liveCount, setLiveCount] = useState(0);
   const [ticker, setTicker] = useState<{ hash: string; amount: string; flag: boolean }[]>([]);
@@ -182,6 +182,14 @@ export function DashboardPage() {
   const criticalAlerts = alerts.filter((a) => a.severity === "critical" && !a.resolved).length;
   const highRiskWallets = walletNodes.filter((w) => w.risk >= 80).length;
   const suspiciousTx = transactions.filter((t) => t.suspicious).length;
+
+  const aiInsights = data.aiInsights ?? {};
+  const aiWallets = Object.values(aiInsights);
+  const avgPriority = aiWallets.length
+    ? aiWallets.reduce((sum, item) => sum + (item.models.alert_prioritizer?.priority_score ?? 0), 0) / aiWallets.length
+    : 0;
+  const anomalyCount = aiWallets.filter((item) => item.models.transaction_anomaly_detector?.is_anomaly).length;
+  const shiftCount = aiWallets.filter((item) => item.models.behavior_shift_detector?.behavior_shift_detected).length;
 
   return (
     <div style={S.page}>
@@ -256,6 +264,39 @@ export function DashboardPage() {
           color="#a855f7"
           trend="up"
         />
+      </div>
+
+      {/* AI model snapshot */}
+      <div style={{ ...S.card, marginBottom: 24 }}>
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 16 }}>
+          <div>
+            <div style={{ color: "#e2f0ff", fontSize: 14, fontWeight: 700 }}>AI Intelligence Snapshot</div>
+            <div style={{ color: "#5b7fa6", fontSize: 11, marginTop: 2 }}>
+              Multi-model signals from risk, anomaly, behavior shift, entity and alert prioritization
+            </div>
+          </div>
+          <div style={{ color: "#7a9cc0", fontSize: 11 }}>
+            Scored wallets: {data.aiIntegration?.scored_wallets ?? 0}
+          </div>
+        </div>
+        <div style={{ display: "grid", gridTemplateColumns: "repeat(4, minmax(0, 1fr))", gap: 12 }}>
+          <div style={{ background: "#071326", border: "1px solid #1a3050", borderRadius: 10, padding: "10px 12px" }}>
+            <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 4 }}>ANOMALY FLAGS</div>
+            <div style={{ color: "#ff7700", fontSize: 18, fontWeight: 700 }}>{anomalyCount}</div>
+          </div>
+          <div style={{ background: "#071326", border: "1px solid #1a3050", borderRadius: 10, padding: "10px 12px" }}>
+            <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 4 }}>BEHAVIOR SHIFTS</div>
+            <div style={{ color: "#f5c518", fontSize: 18, fontWeight: 700 }}>{shiftCount}</div>
+          </div>
+          <div style={{ background: "#071326", border: "1px solid #1a3050", borderRadius: 10, padding: "10px 12px" }}>
+            <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 4 }}>AVG PRIORITY</div>
+            <div style={{ color: "#00aaff", fontSize: 18, fontWeight: 700 }}>{avgPriority.toFixed(1)}</div>
+          </div>
+          <div style={{ background: "#071326", border: "1px solid #1a3050", borderRadius: 10, padding: "10px 12px" }}>
+            <div style={{ color: "#5b7fa6", fontSize: 10, marginBottom: 4 }}>AI ERRORS</div>
+            <div style={{ color: "#ff2b4a", fontSize: 18, fontWeight: 700 }}>{data.aiIntegration?.errors?.length ?? 0}</div>
+          </div>
+        </div>
       </div>
 
       {/* Charts row */}

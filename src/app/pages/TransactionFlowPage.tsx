@@ -18,7 +18,7 @@ import {
   formatAddress,
   timeAgo,
 } from "../data/mockData";
-import { useAnalyticsData } from "../hooks/useAnalyticsData";
+import { useAnalyticsDataWithAi } from "../hooks/useAnalyticsData";
 
 const TYPE_ICON: Record<string, string> = {
   mixer: "⚡",
@@ -29,7 +29,7 @@ const TYPE_ICON: Record<string, string> = {
 };
 
 export function TransactionFlowPage() {
-  const { data } = useAnalyticsData();
+  const { data } = useAnalyticsDataWithAi();
   const { walletNodes, transactions } = data;
 
   const [showSuspiciousOnly, setShowSuspiciousOnly] = useState(false);
@@ -105,6 +105,12 @@ export function TransactionFlowPage() {
     if (!selectedNode) return [];
     return transactions.filter((t) => t.from === selectedNode.id || t.to === selectedNode.id);
   }, [selectedNode, transactions]);
+
+  const selectedAi = useMemo(() => {
+    if (!selectedNode?.address) return null;
+    const key = selectedNode.address.toLowerCase();
+    return data.aiInsights?.[key] ?? null;
+  }, [data.aiInsights, selectedNode]);
 
   return (
     <div style={{ padding: "28px 32px", fontFamily: "'Space Grotesk', sans-serif", background: "#050912", minHeight: "100%", display: "flex", flexDirection: "column" }}>
@@ -427,6 +433,38 @@ export function TransactionFlowPage() {
                     />
                   </div>
                 </div>
+
+                {selectedAi && (
+                  <div style={{ marginBottom: 16, border: "1px solid #1a3050", borderRadius: 8, padding: "10px 12px", background: "rgba(5,9,18,0.6)" }}>
+                    <div style={{ color: "#7a9cc0", fontSize: 11, marginBottom: 8 }}>AI MODEL OUTPUTS</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <div style={{ color: "#5b7fa6", fontSize: 11 }}>AI Risk</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 11, textAlign: "right" }}>
+                        {selectedAi.models.wallet_risk_classifier?.risk_score?.toFixed(1) ?? "-"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 11 }}>Anomaly</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 11, textAlign: "right" }}>
+                        {selectedAi.models.transaction_anomaly_detector?.is_anomaly ? "Yes" : "No"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 11 }}>Behavior Shift</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 11, textAlign: "right" }}>
+                        {selectedAi.models.behavior_shift_detector?.behavior_shift_detected ? "Yes" : "No"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 11 }}>Entity Type</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 11, textAlign: "right" }}>
+                        {selectedAi.models.entity_type_classifier?.entity_type ?? "-"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 11 }}>Alert Priority</div>
+                      <div style={{ color: "#ff7700", fontSize: 11, fontWeight: 700, textAlign: "right" }}>
+                        {selectedAi.models.alert_prioritizer?.priority_score?.toFixed(1) ?? "-"}
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 {/* Info Table */}
                 <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>

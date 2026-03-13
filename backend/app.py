@@ -11,7 +11,7 @@ from dotenv import load_dotenv
 
 from analytics_data import build_analytics_dataset
 from fraud_model import ModelNotTrainedError, predict_from_features, predict_from_wallet_address, train_wallet_risk_model
-from multi_model_trainer import MODEL_FILES, predict_all_models_for_wallet, train_all_models
+from multi_model_trainer import MODEL_FILES, predict_all_models_for_wallet, predict_all_models_for_wallets, train_all_models
 from wallet_analyzer import analyze_transactions
 
 # ---------------------------------------------------------------------------
@@ -91,25 +91,30 @@ def analytics():
     }
     """
     include_ai = (request.args.get("include_ai", "false") or "false").strip().lower() in {"1", "true", "yes"}
+    ai_limit = max(1, min(200, int(request.args.get("ai_limit", default=20, type=int))))
 
     try:
         payload = build_analytics_dataset()
         if include_ai:
             model_errors = []
-            insights = {}
-            for node in payload.get("walletNodes", []):
-                address = str(node.get("address", "")).strip().lower()
-                if not address:
-                    continue
-                try:
-                    insights[address] = predict_all_models_for_wallet(address)
-                except Exception as exc:
-                    model_errors.append({"address": address, "error": str(exc)})
+            addresses = [
+                str(node.get("address", "")).strip().lower()
+                for node in payload.get("walletNodes", [])
+                if str(node.get("address", "")).strip()
+            ][:ai_limit]
+
+            batch_results = predict_all_models_for_wallets(addresses)
+            insights = {item["wallet_address"]: item for item in batch_results}
+
+            missing = [addr for addr in addresses if addr not in insights]
+            for addr in missing:
+                model_errors.append({"address": addr, "error": "Wallet not found in model dataset"})
 
             payload["aiInsights"] = insights
             payload["aiIntegration"] = {
                 "enabled": True,
                 "scored_wallets": len(insights),
+                "scored_limit": ai_limit,
                 "errors": model_errors,
             }
         return jsonify(payload), 200
@@ -351,23 +356,27 @@ def ml_predict_batch():
     dataset_path = body.get("dataset_path")
     artifact_dir = body.get("artifact_dir")
 
-    results = []
+    valid_addresses = []
     errors = []
     for raw in wallet_addresses:
         wallet_address = str(raw or "").strip()
         if not _ETH_ADDRESS_RE.match(wallet_address):
             errors.append({"wallet_address": wallet_address, "error": "Invalid Ethereum wallet address format"})
             continue
-        try:
-            results.append(
-                predict_all_models_for_wallet(
-                    wallet_address=wallet_address,
-                    dataset_path=dataset_path,
-                    artifact_dir=artifact_dir,
-                )
-            )
-        except Exception as exc:
-            errors.append({"wallet_address": wallet_address, "error": str(exc)})
+        valid_addresses.append(wallet_address)
+
+    try:
+        results = predict_all_models_for_wallets(
+            wallet_addresses=valid_addresses,
+            dataset_path=dataset_path,
+            artifact_dir=artifact_dir,
+        )
+        found = {item.get("wallet_address") for item in results}
+        for wallet_address in valid_addresses:
+            if wallet_address.lower() not in found:
+                errors.append({"wallet_address": wallet_address, "error": "Wallet not found in model dataset"})
+    except Exception as exc:
+        return jsonify({"error": f"Batch prediction failed: {exc}"}), 500
 
     return jsonify({
         "count": len(results),

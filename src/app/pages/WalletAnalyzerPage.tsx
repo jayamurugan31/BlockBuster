@@ -14,7 +14,7 @@ import {
   RotateCcw,
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer } from "recharts";
-import { analyzeWallet, type WalletAnalysisResponse, type FlowTransaction } from "../api/walletAnalyzerApi";
+import { analyzeWallet, predictAllAiFeatures, type WalletAnalysisResponse, type FlowTransaction, type MlAllFeaturesResponse } from "../api/walletAnalyzerApi";
 import { getRiskColor, getRiskLabel, formatAddress, timeAgo } from "../data/mockData";
 
 interface Counterparty {
@@ -367,6 +367,7 @@ export function WalletAnalyzerPage() {
   const [analyzing, setAnalyzing] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [analysis, setAnalysis] = useState<WalletAnalysisResponse | null>(null);
+  const [aiFeatures, setAiFeatures] = useState<MlAllFeaturesResponse | null>(null);
   const [copied, setCopied] = useState(false);
 
   const executeAnalysis = async () => {
@@ -379,8 +380,15 @@ export function WalletAnalyzerPage() {
     try {
       const response = await analyzeWallet(walletAddress);
       setAnalysis(response);
+      try {
+        const ai = await predictAllAiFeatures(walletAddress);
+        setAiFeatures(ai);
+      } catch {
+        setAiFeatures(null);
+      }
     } catch (err) {
       setAnalysis(null);
+      setAiFeatures(null);
       setErrorMessage(err instanceof Error ? err.message : "Unexpected error during wallet analysis.");
     } finally {
       setAnalyzing(false);
@@ -625,6 +633,33 @@ export function WalletAnalyzerPage() {
                     />
                   </div>
                 </div>
+
+                {aiFeatures && (
+                  <div style={{ marginBottom: 14, background: "#050912", border: "1px solid #0f1e35", borderRadius: 8, padding: "10px 12px" }}>
+                    <div style={{ color: "#7a9cc0", fontSize: 10, letterSpacing: "0.05em", marginBottom: 8 }}>AI MODEL SIGNALS</div>
+                    <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Anomaly</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 10, textAlign: "right" }}>
+                        {aiFeatures.models.transaction_anomaly_detector?.is_anomaly ? "Detected" : "Normal"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Behavior Shift</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 10, textAlign: "right" }}>
+                        {aiFeatures.models.behavior_shift_detector?.behavior_shift_detected ? "Detected" : "None"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Entity Type</div>
+                      <div style={{ color: "#e2f0ff", fontSize: 10, textAlign: "right" }}>
+                        {aiFeatures.models.entity_type_classifier?.entity_type ?? "Unknown"}
+                      </div>
+
+                      <div style={{ color: "#5b7fa6", fontSize: 10 }}>Priority Score</div>
+                      <div style={{ color: "#ff7700", fontSize: 10, textAlign: "right", fontWeight: 700 }}>
+                        {aiFeatures.models.alert_prioritizer?.priority_score?.toFixed(1) ?? "-"}
+                      </div>
+                    </div>
+                  </div>
+                )}
 
                 <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
                   {[
