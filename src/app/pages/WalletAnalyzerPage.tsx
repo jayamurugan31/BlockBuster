@@ -896,6 +896,231 @@ export function WalletAnalyzerPage() {
     };
   }, [analysis, transactions, suspiciousHashes, aiFeatures, counterparties]);
 
+  const multiHopGraph = useMemo(() => {
+    if (!analysis) return null;
+    const me = analysis.wallet_address.toLowerCase();
+
+    const outboundSet = new Set<string>();
+    const inboundSet = new Set<string>();
+    analysis.transaction_flow.forEach((tx) => {
+      const from = tx.from.toLowerCase();
+      const to = tx.to.toLowerCase();
+      if (from === me && to && to !== me) outboundSet.add(to);
+      if (to === me && from && from !== me) inboundSet.add(from);
+    });
+
+    const firstHopNodes = new Set<string>([...outboundSet, ...inboundSet]);
+    const intelNodes = new Set<string>((analysis.threat_intelligence?.matches ?? []).map((m) => m.address.toLowerCase()));
+    const secondHopNodes = new Set<string>([...intelNodes].filter((addr) => addr !== me && !firstHopNodes.has(addr)));
+
+    const branching = Math.max(1, Math.round(counterparties.slice(0, 8).reduce((sum, cp) => sum + cp.txCount, 0) / Math.max(1, Math.min(8, counterparties.length))));
+    const thirdHopEstimate = Math.max(1, Math.min(180, secondHopNodes.size * branching));
+
+    const avgCounterpartyRisk = counterparties.length
+      ? counterparties.reduce((sum, cp) => sum + cp.risk, 0) / counterparties.length
+      : 0;
+
+    const hops = [
+      {
+        hop: "1-Hop",
+        nodes: firstHopNodes.size,
+        edges: analysis.transaction_flow.length,
+        exposure: Number((Math.min(100, avgCounterpartyRisk * 0.95)).toFixed(1)),
+      },
+      {
+        hop: "2-Hop",
+        nodes: secondHopNodes.size,
+        edges: Math.max(0, secondHopNodes.size * 2),
+        exposure: Number((Math.min(100, avgCounterpartyRisk * 0.72 + suspiciousPairs.size * 0.9)).toFixed(1)),
+      },
+      {
+        hop: "3-Hop",
+        nodes: thirdHopEstimate,
+        edges: Math.max(0, Math.round(thirdHopEstimate * 1.7)),
+        exposure: Number((Math.min(100, avgCounterpartyRisk * 0.53 + suspiciousPairs.size * 0.6)).toFixed(1)),
+      },
+    ];
+
+    return {
+      hops,
+      summary: {
+        inboundCounterparties: inboundSet.size,
+        outboundCounterparties: outboundSet.size,
+      },
+    };
+  }, [analysis, counterparties, suspiciousPairs]);
+
+  const patternDetection = useMemo(() => {
+    if (!analysis) return null;
+    const me = analysis.wallet_address.toLowerCase();
+
+    const inboundTx = transactions.filter((tx) => tx.to.toLowerCase() === me);
+    const outboundTx = transactions.filter((tx) => tx.from.toLowerCase() === me);
+
+    const inboundActors = new Set(inboundTx.map((tx) => tx.from.toLowerCase())).size;
+    const outboundActors = new Set(outboundTx.map((tx) => tx.to.toLowerCase())).size;
+
+    const fanInScore = inboundActors > 0 ? (inboundActors / Math.max(1, outboundActors)) * 60 + inboundTx.length * 0.7 : 0;
+    const fanOutScore = outboundActors > 0 ? (outboundActors / Math.max(1, inboundActors)) * 60 + outboundTx.length * 0.7 : 0;
+
+    const recentOutbound = outboundTx.slice(0, 8).map((tx) => tx.value_eth);
+    let peelTrendHits = 0;
+    for (let i = 0; i < recentOutbound.length - 1; i++) {
+      if (recentOutbound[i + 1] < recentOutbound[i] * 0.78) peelTrendHits += 1;
+    }
+    const peelChainScore = Math.min(100, peelTrendHits * 28 + (outboundTx.length > inboundTx.length ? 15 : 0));
+
+    const hourly = new Map<string, number>();
+    transactions.forEach((tx) => {
+      const dt = new Date(tx.timestamp);
+      if (Number.isNaN(dt.getTime())) return;
+      const key = `${dt.getUTCFullYear()}-${dt.getUTCMonth()}-${dt.getUTCDate()}-${dt.getUTCHours()}`;
+      hourly.set(key, (hourly.get(key) ?? 0) + 1);
+    });
+    const maxBurst = Math.max(0, ...hourly.values());
+    const burstScore = Math.min(100, maxBurst * 11 + (suspiciousHashes.size > 0 ? 8 : 0));
+
+    return [
+      { pattern: "Fan-In", score: Number(Math.min(100, fanInScore).toFixed(1)), detected: fanInScore >= 58, note: `${inboundActors} inbound entities` },
+      { pattern: "Fan-Out", score: Number(Math.min(100, fanOutScore).toFixed(1)), detected: fanOutScore >= 58, note: `${outboundActors} outbound entities` },
+      { pattern: "Peel Chain", score: Number(peelChainScore.toFixed(1)), detected: peelChainScore >= 52, note: `${peelTrendHits} descending transfer steps` },
+      { pattern: "Burst Behavior", score: Number(burstScore.toFixed(1)), detected: burstScore >= 56, note: `${maxBurst} tx peak in one hour` },
+    ];
+  }, [analysis, transactions, suspiciousHashes]);
+
+  const edgeRiskPropagation = useMemo(() => {
+    if (!analysis) return [] as Array<{ edge: string; riskPropagation: number; hopWeight: number }>;
+
+    const totalVolume = Math.max(0.000001, transactions.reduce((sum, tx) => sum + tx.value_eth, 0));
+    const me = analysis.wallet_address.toLowerCase();
+
+    return counterparties.slice(0, 8).map((cp) => {
+      const linkedTx = transactions.filter((tx) => {
+        const from = tx.from.toLowerCase();
+        const to = tx.to.toLowerCase();
+        return (from === me && to === cp.address) || (to === me && from === cp.address);
+      });
+      const edgeVolume = linkedTx.reduce((sum, tx) => sum + tx.value_eth, 0);
+      const volumeWeight = (edgeVolume / totalVolume) * 100;
+      const suspiciousWeight = linkedTx.length > 0
+        ? (linkedTx.filter((tx) => suspiciousHashes.has(tx.hash)).length / linkedTx.length) * 100
+        : 0;
+      const contagionBoost = (aiFeatures?.models.counterparty_contagion_regressor?.contagion_score ?? 0) * 0.24;
+
+      const riskPropagation = Math.max(0, Math.min(100, cp.risk * 0.52 + volumeWeight * 0.34 + suspiciousWeight * 0.28 + contagionBoost));
+
+      return {
+        edge: `${formatAddress(analysis.wallet_address)} -> ${formatAddress(cp.address)}`,
+        riskPropagation: Number(riskPropagation.toFixed(1)),
+        hopWeight: Number((volumeWeight * 0.7 + cp.txCount * 1.4).toFixed(1)),
+      };
+    });
+  }, [analysis, transactions, counterparties, suspiciousHashes, aiFeatures]);
+
+  const explainability2 = useMemo(() => {
+    if (!analysis || !aiFeatures) return null;
+
+    const riskProb = aiFeatures.models.wallet_risk_classifier?.risk_probability;
+    const anomalyScore = aiFeatures.models.transaction_anomaly_detector?.anomaly_score;
+    const shiftScore = aiFeatures.models.behavior_shift_detector?.shift_score;
+    const contagion = aiFeatures.models.counterparty_contagion_regressor?.contagion_score;
+    const priority = aiFeatures.models.alert_prioritizer?.priority_score;
+
+    const models = [
+      {
+        name: "Wallet Risk",
+        confidence: typeof riskProb === "number" ? Math.max(50, Math.min(99, (0.5 + Math.abs(riskProb - 0.5)) * 100)) : 55,
+        contribution: typeof riskProb === "number" ? (riskProb - 0.5) * 130 : 0,
+        evidence: typeof riskProb === "number" ? `risk_probability=${riskProb.toFixed(3)}` : "no probability returned",
+      },
+      {
+        name: "Anomaly Detector",
+        confidence: typeof anomalyScore === "number" ? Math.max(50, Math.min(97, Math.abs(anomalyScore) * 100)) : 56,
+        contribution: aiFeatures.models.transaction_anomaly_detector?.is_anomaly ? Math.abs(anomalyScore ?? 0) * 85 : -Math.abs(anomalyScore ?? 0) * 40,
+        evidence: `is_anomaly=${aiFeatures.models.transaction_anomaly_detector?.is_anomaly ? "true" : "false"}`,
+      },
+      {
+        name: "Behavior Shift",
+        confidence: typeof shiftScore === "number" ? Math.max(52, Math.min(96, Math.abs(shiftScore) * 100)) : 58,
+        contribution: aiFeatures.models.behavior_shift_detector?.behavior_shift_detected ? Math.abs(shiftScore ?? 0) * 75 : -Math.abs(shiftScore ?? 0) * 32,
+        evidence: `shift_detected=${aiFeatures.models.behavior_shift_detector?.behavior_shift_detected ? "true" : "false"}`,
+      },
+      {
+        name: "Contagion",
+        confidence: typeof contagion === "number" ? Math.max(56, Math.min(94, 58 + Math.abs(contagion - 50) * 0.7)) : 57,
+        contribution: typeof contagion === "number" ? (contagion - 40) * 0.95 : 0,
+        evidence: typeof contagion === "number" ? `contagion_score=${contagion.toFixed(2)}` : "no contagion score",
+      },
+      {
+        name: "Alert Prioritizer",
+        confidence: typeof priority === "number" ? Math.max(54, Math.min(95, 60 + Math.abs(priority - 50) * 0.65)) : 56,
+        contribution: typeof priority === "number" ? (priority - 50) * 0.8 : 0,
+        evidence: typeof priority === "number" ? `priority_score=${priority.toFixed(2)}` : "no priority score",
+      },
+    ].map((item) => ({
+      ...item,
+      confidence: Number(item.confidence.toFixed(1)),
+      contribution: Number(Math.max(-100, Math.min(100, item.contribution)).toFixed(1)),
+      absContribution: Number(Math.abs(item.contribution).toFixed(1)),
+    }));
+
+    const avgAmount = transactions.length
+      ? transactions.reduce((sum, tx) => sum + tx.value_eth, 0) / transactions.length
+      : 0;
+
+    const timeline = transactions
+      .slice(0, 10)
+      .reverse()
+      .map((tx, idx, arr) => {
+        const previousTs = idx > 0 ? Date.parse(arr[idx - 1].timestamp) : null;
+        const currentTs = Date.parse(tx.timestamp);
+        const rapid = previousTs !== null && Number.isFinite(previousTs) && Number.isFinite(currentTs)
+          ? Math.abs(currentTs - previousTs) < 5 * 60 * 1000
+          : false;
+        const largeAmount = tx.value_eth > avgAmount * 1.8;
+        const suspicious = suspiciousHashes.has(tx.hash);
+
+        const impact = (suspicious ? 42 : 8) + (rapid ? 16 : 0) + (largeAmount ? 14 : 0);
+        const evidence = [
+          suspicious ? "Anomaly model: flagged tx hash" : "Anomaly model: no direct flag",
+          rapid ? "Behavior-shift model: rapid sequence" : "Behavior-shift model: normal cadence",
+          largeAmount ? "Risk model: amount above wallet baseline" : "Risk model: baseline volume",
+        ].join(" | ");
+
+        return {
+          step: idx + 1,
+          label: tx.timestamp.slice(5, 16).replace("T", " "),
+          impact,
+          evidence,
+        };
+      });
+
+    const weightedScore = models.reduce((sum, m) => sum + m.contribution, 0) / Math.max(1, models.length);
+    const modelConfidence = models.reduce((sum, m) => sum + m.confidence, 0) / Math.max(1, models.length);
+    const finalScore = Math.max(0, Math.min(100, analysis.risk_score * 0.56 + (upcomingTxPrediction?.score ?? 0) * 0.26 + weightedScore * 0.18 + 12));
+
+    let band: "High" | "Medium" | "Low" = "Low";
+    let decision = "Observe";
+    if (finalScore >= 72) {
+      band = "High";
+      decision = "Escalate and freeze pending review";
+    } else if (finalScore >= 45) {
+      band = "Medium";
+      decision = "Monitor with elevated alerting";
+    }
+
+    return {
+      models,
+      timeline,
+      recommendation: {
+        band,
+        decision,
+        confidence: Number(modelConfidence.toFixed(1)),
+        score: Number(finalScore.toFixed(1)),
+      },
+    };
+  }, [analysis, aiFeatures, transactions, suspiciousHashes, upcomingTxPrediction]);
+
   const walletProfileTrends = useMemo(() => {
     if (!analysis) return null;
 
@@ -1898,6 +2123,175 @@ export function WalletAnalyzerPage() {
                   </ResponsiveContainer>
                 </div>
               </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 20 }}>
+                <div
+                  style={{
+                    background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
+                    border: "1px solid #1a3050",
+                    borderRadius: 12,
+                    padding: 24,
+                  }}
+                >
+                  <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Graph Intelligence Expansion</div>
+                  <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 14 }}>
+                    Multi-hop network expansion across 1-hop, 2-hop and 3-hop proximity
+                  </div>
+
+                  <ResponsiveContainer width="100%" height={210}>
+                    <BarChart data={multiHopGraph?.hops ?? []}>
+                      <CartesianGrid stroke="#13263f" strokeDasharray="3 3" />
+                      <XAxis dataKey="hop" tick={{ fill: "#5b7fa6", fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <YAxis tick={{ fill: "#5b7fa6", fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <Tooltip content={<CompactTooltip />} />
+                      <Legend />
+                      <Bar dataKey="nodes" name="Nodes" fill="#2f95ff" radius={[4, 4, 0, 0]} />
+                      <Bar dataKey="edges" name="Edges" fill="#8b9dff" radius={[4, 4, 0, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+
+                  <div style={{ marginTop: 12, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10 }}>
+                    <div style={{ background: "#071021", border: "1px solid #173453", borderRadius: 8, padding: "8px 10px" }}>
+                      <div style={{ color: "#6f99bc", fontSize: 10 }}>Fan-In Potential</div>
+                      <div style={{ color: "#d8ecff", fontWeight: 700, fontSize: 12 }}>{multiHopGraph?.summary.inboundCounterparties ?? 0} entities</div>
+                    </div>
+                    <div style={{ background: "#071021", border: "1px solid #173453", borderRadius: 8, padding: "8px 10px" }}>
+                      <div style={{ color: "#6f99bc", fontSize: 10 }}>Fan-Out Potential</div>
+                      <div style={{ color: "#d8ecff", fontWeight: 700, fontSize: 12 }}>{multiHopGraph?.summary.outboundCounterparties ?? 0} entities</div>
+                    </div>
+                  </div>
+                </div>
+
+                <div
+                  style={{
+                    background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
+                    border: "1px solid #1a3050",
+                    borderRadius: 12,
+                    padding: 24,
+                  }}
+                >
+                  <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Pattern Detection</div>
+                  <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 14 }}>
+                    Fan-in, fan-out, peel-chain, and burst behavior signatures
+                  </div>
+
+                  <div style={{ display: "grid", gap: 8 }}>
+                    {(patternDetection ?? []).map((item) => (
+                      <div key={item.pattern} style={{ background: "#071021", border: `1px solid ${item.detected ? "#ff7f5066" : "#173453"}`, borderRadius: 8, padding: "8px 10px" }}>
+                        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 5 }}>
+                          <div style={{ color: "#d8ecff", fontSize: 12, fontWeight: 700 }}>{item.pattern}</div>
+                          <div style={{ color: item.detected ? "#ffbf91" : "#8eb6d5", fontSize: 11 }}>
+                            {item.detected ? "Detected" : "Weak"} · {item.score.toFixed(1)}
+                          </div>
+                        </div>
+                        <div style={{ height: 6, background: "#0f1e35", borderRadius: 4, overflow: "hidden", marginBottom: 4 }}>
+                          <div style={{ width: `${item.score}%`, height: "100%", background: item.detected ? "linear-gradient(90deg, #ff9f43, #ff6b6b)" : "linear-gradient(90deg, #2f95ff, #5ed39a)" }} />
+                        </div>
+                        <div style={{ color: "#7fa4c3", fontSize: 10 }}>{item.note}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              </div>
+
+              <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 20 }}>
+                <div
+                  style={{
+                    background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
+                    border: "1px solid #1a3050",
+                    borderRadius: 12,
+                    padding: 24,
+                  }}
+                >
+                  <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Risk Propagation Across Edges</div>
+                  <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 14 }}>
+                    Propagated risk over direct graph edges using volume, suspicious density and contagion signal
+                  </div>
+                  <ResponsiveContainer width="100%" height={220}>
+                    <BarChart data={edgeRiskPropagation} layout="vertical" margin={{ left: 18, right: 6 }}>
+                      <CartesianGrid stroke="#13263f" strokeDasharray="3 3" />
+                      <XAxis type="number" tick={{ fill: "#5b7fa6", fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <YAxis type="category" dataKey="edge" tick={{ fill: "#5b7fa6", fontSize: 9 }} axisLine={false} tickLine={false} width={120} />
+                      <Tooltip content={<CompactTooltip />} />
+                      <Legend />
+                      <Bar dataKey="riskPropagation" name="Propagation Score" fill="#ff6b6b" radius={[0, 4, 4, 0]} />
+                      <Bar dataKey="hopWeight" name="Edge Weight" fill="#2f95ff" radius={[0, 4, 4, 0]} />
+                    </BarChart>
+                  </ResponsiveContainer>
+                </div>
+
+                {explainability2 && (
+                  <div
+                    style={{
+                      background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
+                      border: "1px solid #1a3050",
+                      borderRadius: 12,
+                      padding: 24,
+                    }}
+                  >
+                    <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Explainability 2.0</div>
+                    <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 14 }}>
+                      Per-model confidence, feature contribution and recommendation confidence band
+                    </div>
+
+                    <ResponsiveContainer width="100%" height={170}>
+                      <BarChart data={explainability2.models}>
+                        <CartesianGrid stroke="#13263f" strokeDasharray="3 3" />
+                        <XAxis dataKey="name" tick={{ fill: "#5b7fa6", fontSize: 9 }} axisLine={false} tickLine={false} />
+                        <YAxis tick={{ fill: "#5b7fa6", fontSize: 10 }} axisLine={false} tickLine={false} />
+                        <Tooltip content={<CompactTooltip />} />
+                        <Legend />
+                        <Bar dataKey="confidence" name="Confidence %" fill="#2f95ff" radius={[4, 4, 0, 0]} />
+                        <Bar dataKey="absContribution" name="Contribution |impact|" fill="#f5c518" radius={[4, 4, 0, 0]} />
+                      </BarChart>
+                    </ResponsiveContainer>
+
+                    <div style={{ marginTop: 10, background: "#071021", border: "1px solid #173453", borderRadius: 8, padding: "8px 10px" }}>
+                      <div style={{ color: "#8cb2d3", fontSize: 10, marginBottom: 4 }}>Recommendation Confidence Band</div>
+                      <div style={{ color: explainability2.recommendation.band === "High" ? "#ffb4a2" : explainability2.recommendation.band === "Medium" ? "#ffe2a8" : "#9de6c2", fontWeight: 700, fontSize: 12 }}>
+                        {explainability2.recommendation.band} · {explainability2.recommendation.decision}
+                      </div>
+                      <div style={{ color: "#9fc3e0", fontSize: 10, marginTop: 2 }}>
+                        Final confidence {explainability2.recommendation.confidence.toFixed(1)}% · composite score {explainability2.recommendation.score.toFixed(1)}/100
+                      </div>
+                    </div>
+                  </div>
+                )}
+              </div>
+
+              {explainability2 && (
+                <div
+                  style={{
+                    background: "linear-gradient(135deg, #090f1e 0%, #0a1628 100%)",
+                    border: "1px solid #1a3050",
+                    borderRadius: 12,
+                    padding: 24,
+                  }}
+                >
+                  <div style={{ color: "#e2f0ff", fontWeight: 700, fontSize: 14, marginBottom: 4 }}>Why Suspicious Timeline (Model-by-Model Evidence)</div>
+                  <div style={{ color: "#5b7fa6", fontSize: 11, marginBottom: 14 }}>
+                    Event timeline enriched with anomaly, behavior shift and risk-model evidence
+                  </div>
+                  <ResponsiveContainer width="100%" height={180}>
+                    <LineChart data={explainability2.timeline}>
+                      <CartesianGrid stroke="#13263f" strokeDasharray="3 3" />
+                      <XAxis dataKey="label" tick={{ fill: "#5b7fa6", fontSize: 9 }} axisLine={false} tickLine={false} />
+                      <YAxis tick={{ fill: "#5b7fa6", fontSize: 10 }} axisLine={false} tickLine={false} />
+                      <Tooltip content={<CompactTooltip />} />
+                      <Line type="monotone" dataKey="impact" name="Risk Impact" stroke="#ff7f50" strokeWidth={2} dot={false} />
+                    </LineChart>
+                  </ResponsiveContainer>
+
+                  <div style={{ marginTop: 10, display: "grid", gap: 6 }}>
+                    {explainability2.timeline.slice(-3).map((item) => (
+                      <div key={`${item.step}_${item.label}`} style={{ background: "#071021", border: "1px solid #173453", borderRadius: 8, padding: "7px 9px" }}>
+                        <div style={{ color: "#d8ecff", fontSize: 11, marginBottom: 2 }}>{item.label}</div>
+                        <div style={{ color: "#88adcd", fontSize: 10 }}>{item.evidence}</div>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
             </div>
           )}
 
