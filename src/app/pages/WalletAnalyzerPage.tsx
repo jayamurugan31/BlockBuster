@@ -13,6 +13,7 @@ import {
   Plus,
   Minus,
   RotateCcw,
+  X,
 } from "lucide-react";
 import { AreaChart, Area, XAxis, YAxis, Tooltip, ResponsiveContainer, PieChart, Pie, Cell, BarChart, Bar, CartesianGrid, LineChart, Line, Legend } from "recharts";
 import jsPDF from "jspdf";
@@ -38,14 +39,43 @@ interface Counterparty {
   risk: number;
 }
 
+interface GraphNodeSelection {
+  address: string;
+  txCount: number;
+  suspiciousTxCount: number;
+  risk: number;
+  suspicious: boolean;
+}
+
+interface NodeTimelineItem {
+  id: string;
+  timestamp: string;
+  direction: "inbound" | "outbound";
+  amountEth: number;
+  suspicious: boolean;
+  reasons: string[];
+}
+
 function MiniFlowGraph({
   walletAddress,
   counterparties,
   suspiciousPairs,
+  selectedNode,
+  nodeAi,
+  nodeAiLoading,
+  nodeAiError,
+  nodeTimeline,
+  onNodeSelect,
 }: {
   walletAddress: string;
   counterparties: Counterparty[];
   suspiciousPairs: Set<string>;
+  selectedNode: GraphNodeSelection | null;
+  nodeAi: MlAllFeaturesResponse | null;
+  nodeAiLoading: boolean;
+  nodeAiError: string | null;
+  nodeTimeline: NodeTimelineItem[];
+  onNodeSelect: (node: GraphNodeSelection | null) => void;
 }) {
   const VIEW_WIDTH = 760;
   const VIEW_HEIGHT = 460;
@@ -58,6 +88,11 @@ function MiniFlowGraph({
   const [pan, setPan] = useState({ x: 0, y: 0 });
   const [isPanning, setIsPanning] = useState(false);
   const [hoveredAddress, setHoveredAddress] = useState<string | null>(null);
+  const [lockedAddress, setLockedAddress] = useState<string | null>(null);
+  const [showOnlySuspicious, setShowOnlySuspicious] = useState(false);
+  const [layoutMode, setLayoutMode] = useState<"rings" | "spiral">("rings");
+  const [sizeMode, setSizeMode] = useState<"impact" | "uniform">("impact");
+  const [showLabels, setShowLabels] = useState(true);
   const dragRef = useRef<{ x: number; y: number; panX: number; panY: number } | null>(null);
 
   const clampPan = (nextX: number, nextY: number, nextZoom: number) => {
@@ -70,16 +105,25 @@ function MiniFlowGraph({
   };
 
   const nodes = useMemo(() => {
-    const ranked = counterparties.slice(0, 10);
+    const filtered = showOnlySuspicious
+      ? counterparties.filter((node) => suspiciousPairs.has([walletAddress, node.address].sort().join("|")))
+      : counterparties;
+    const ranked = filtered.slice(0, 12);
+
     return ranked.map((node, index) => {
       const angle = (index / Math.max(1, ranked.length)) * Math.PI * 2 - Math.PI / 2;
       const ring = index < 5 ? 150 : 202;
-      const radius = ring + (index % 2 === 0 ? 8 : -8);
+      const spiralRadius = 108 + index * 16;
+      const radius = layoutMode === "rings"
+        ? ring + (index % 2 === 0 ? 8 : -8)
+        : spiralRadius;
       const x = CENTER_X + Math.cos(angle) * radius;
       const y = CENTER_Y + Math.sin(angle) * radius;
       const pairKey = [walletAddress, node.address].sort().join("|");
       const suspicious = suspiciousPairs.has(pairKey);
-      const nodeRadius = Math.min(20, 10 + node.txCount * 0.85 + node.suspiciousTxCount * 2.4);
+      const nodeRadius = sizeMode === "uniform"
+        ? 11
+        : Math.min(20, 10 + node.txCount * 0.85 + node.suspiciousTxCount * 2.4);
 
       return {
         ...node,
@@ -90,17 +134,45 @@ function MiniFlowGraph({
         pairKey,
       };
     });
-  }, [counterparties, suspiciousPairs, walletAddress]);
+  }, [counterparties, suspiciousPairs, walletAddress, showOnlySuspicious, layoutMode, sizeMode]);
 
-  const hoveredNode = nodes.find((node) => node.address === hoveredAddress) ?? null;
+  const activeAddress = hoveredAddress ?? lockedAddress;
+  const hoveredNode = nodes.find((node) => node.address === activeAddress) ?? null;
+  const lockedNode = nodes.find((node) => node.address === lockedAddress) ?? null;
 
   useEffect(() => {
     setZoom(1.05);
     setPan({ x: 0, y: 0 });
     setHoveredAddress(null);
+    setLockedAddress(null);
+    setShowOnlySuspicious(false);
+    setLayoutMode("rings");
+    setSizeMode("impact");
+    setShowLabels(true);
     setIsPanning(false);
     dragRef.current = null;
   }, [walletAddress]);
+
+  useEffect(() => {
+    setLockedAddress(selectedNode?.address ?? null);
+  }, [selectedNode?.address]);
+
+  useEffect(() => {
+    if (!lockedAddress) return;
+    if (!nodes.some((node) => node.address === lockedAddress)) {
+      setLockedAddress(null);
+    }
+  }, [nodes, lockedAddress]);
+
+  useEffect(() => {
+    if (!lockedAddress) return;
+    const focusedNode = nodes.find((node) => node.address === lockedAddress);
+    if (!focusedNode) return;
+
+    const targetX = (CENTER_X - focusedNode.x) * zoom;
+    const targetY = (CENTER_Y - focusedNode.y) * zoom;
+    setPan(clampPan(targetX, targetY, zoom));
+  }, [lockedAddress, nodes, zoom]);
 
   useEffect(() => {
     setPan((prev) => clampPan(prev.x, prev.y, zoom));
@@ -155,6 +227,8 @@ function MiniFlowGraph({
           onClick={() => {
             setZoom(1.05);
             setPan({ x: 0, y: 0 });
+            setLockedAddress(null);
+            setHoveredAddress(null);
           }}
           style={{
             width: 28,
@@ -170,6 +244,217 @@ function MiniFlowGraph({
           title="Reset view"
         >
           <RotateCcw size={13} />
+        </button>
+      </div>
+
+      {lockedNode && (
+        <div
+          style={{
+            position: "absolute",
+            top: 0,
+            right: 0,
+            bottom: 0,
+            width: 312,
+            zIndex: 4,
+            background: "linear-gradient(160deg, rgba(6,14,26,0.97), rgba(9,22,40,0.97))",
+            borderLeft: "1px solid #214467",
+            boxShadow: "-16px 0 28px rgba(0,0,0,0.28)",
+            display: "flex",
+            flexDirection: "column",
+            overflow: "hidden",
+          }}
+        >
+          <div
+            style={{
+              padding: "10px 12px",
+              borderBottom: "1px solid #1a3554",
+              display: "flex",
+              justifyContent: "space-between",
+              alignItems: "center",
+            }}
+          >
+            <div>
+              <div style={{ color: "#cfe7ff", fontSize: 11, fontWeight: 700, letterSpacing: "0.05em" }}>NODE XAI DRAWER</div>
+              <div style={{ color: "#8eb4d4", fontSize: 10, marginTop: 2 }}>{formatAddress(lockedNode.address)}</div>
+            </div>
+            <button
+              onClick={() => onNodeSelect(null)}
+              style={{
+                width: 24,
+                height: 24,
+                borderRadius: 6,
+                border: "1px solid #2a5279",
+                background: "rgba(5,12,22,0.78)",
+                color: "#9fc3e0",
+                cursor: "pointer",
+                display: "grid",
+                placeItems: "center",
+              }}
+              title="Close drawer"
+            >
+              <X size={13} />
+            </button>
+          </div>
+
+          <div style={{ padding: "10px 12px", borderBottom: "1px solid #1a3554" }}>
+            <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
+              <div style={{ background: "#071021", border: "1px solid #1d3a5b", borderRadius: 7, padding: "6px 8px" }}>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Tx Count</div>
+                <div style={{ color: "#d8ecff", fontSize: 11, fontWeight: 700 }}>{lockedNode.txCount}</div>
+              </div>
+              <div style={{ background: "#071021", border: "1px solid #1d3a5b", borderRadius: 7, padding: "6px 8px" }}>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Suspicious Tx</div>
+                <div style={{ color: "#ffb1be", fontSize: 11, fontWeight: 700 }}>{lockedNode.suspiciousTxCount}</div>
+              </div>
+              <div style={{ background: "#071021", border: "1px solid #1d3a5b", borderRadius: 7, padding: "6px 8px" }}>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Derived Risk</div>
+                <div style={{ color: getRiskColor(lockedNode.risk), fontSize: 11, fontWeight: 700 }}>{lockedNode.risk}/100</div>
+              </div>
+              <div style={{ background: "#071021", border: "1px solid #1d3a5b", borderRadius: 7, padding: "6px 8px" }}>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Edge Flag</div>
+                <div style={{ color: lockedNode.suspicious ? "#ff9fb0" : "#9de6c2", fontSize: 11, fontWeight: 700 }}>
+                  {lockedNode.suspicious ? "Suspicious" : "Observed"}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ padding: "10px 12px", borderBottom: "1px solid #1a3554" }}>
+            <div style={{ color: "#8ab1d2", fontSize: 10, marginBottom: 6 }}>Model Explainability</div>
+
+            {nodeAiLoading && <div style={{ color: "#9bc6ea", fontSize: 10 }}>Running model inference for this wallet...</div>}
+            {nodeAiError && <div style={{ color: "#ff9db0", fontSize: 10 }}>{nodeAiError}</div>}
+
+            {!nodeAiLoading && !nodeAiError && nodeAi && (
+              <div style={{ display: "flex", flexDirection: "column", gap: 5 }}>
+                <div style={{ color: "#89afcf", fontSize: 10 }}>Decision: <span style={{ color: "#cfe7ff", fontWeight: 700 }}>{nodeAi.explainability?.decision?.toUpperCase() ?? "MONITOR"}</span></div>
+                <div style={{ color: "#89afcf", fontSize: 10 }}>Anomaly: <span style={{ color: "#cfe7ff" }}>{nodeAi.models.transaction_anomaly_detector?.is_anomaly ? "Detected" : "Normal"}</span></div>
+                <div style={{ color: "#89afcf", fontSize: 10 }}>Behavior Shift: <span style={{ color: "#cfe7ff" }}>{nodeAi.models.behavior_shift_detector?.behavior_shift_detected ? "Detected" : "None"}</span></div>
+                <div style={{ color: "#89afcf", fontSize: 10 }}>Priority Score: <span style={{ color: "#ffc083", fontWeight: 700 }}>{nodeAi.models.alert_prioritizer?.priority_score?.toFixed(1) ?? "-"}</span></div>
+                <div style={{ color: "#89afcf", fontSize: 10 }}>Contagion: <span style={{ color: "#cfe7ff" }}>{nodeAi.models.counterparty_contagion_regressor?.contagion_score?.toFixed(2) ?? "-"}</span></div>
+
+                {(nodeAi.explainability?.reasons ?? []).slice(0, 3).map((reason) => (
+                  <div key={reason} style={{ color: "#a8c6de", fontSize: 9, lineHeight: 1.35 }}>• {reason}</div>
+                ))}
+              </div>
+            )}
+
+            {!nodeAiLoading && !nodeAiError && !nodeAi && (
+              <div style={{ color: "#89afcf", fontSize: 10 }}>
+                AI features unavailable for this wallet in the current dataset. Showing behavior timeline below.
+              </div>
+            )}
+          </div>
+
+          <div style={{ padding: "10px 12px", overflow: "auto" }}>
+            <div style={{ color: "#8ab1d2", fontSize: 10, marginBottom: 6 }}>Why Suspicious Timeline</div>
+            <div style={{ display: "flex", flexDirection: "column", gap: 6 }}>
+              {nodeTimeline.length === 0 && (
+                <div style={{ color: "#89afcf", fontSize: 10 }}>No timeline events available for this node.</div>
+              )}
+              {nodeTimeline.map((event) => (
+                <div key={event.id} style={{ background: "#071021", border: "1px solid #1d3a5b", borderRadius: 7, padding: "6px 8px" }}>
+                  <div style={{ display: "flex", justifyContent: "space-between", gap: 8, marginBottom: 2 }}>
+                    <div style={{ color: "#cfe7ff", fontSize: 9 }}>{event.timestamp}</div>
+                    <div style={{ color: event.suspicious ? "#ff9fb0" : "#9de6c2", fontSize: 9 }}>
+                      {event.direction === "inbound" ? "IN" : "OUT"} · {event.amountEth.toFixed(4)} ETH
+                    </div>
+                  </div>
+                  {event.reasons.length > 0 ? (
+                    event.reasons.slice(0, 2).map((reason) => (
+                      <div key={reason} style={{ color: "#9fc3e0", fontSize: 9, lineHeight: 1.35 }}>• {reason}</div>
+                    ))
+                  ) : (
+                    <div style={{ color: "#89afcf", fontSize: 9 }}>• No explicit suspicious reason tag on this event.</div>
+                  )}
+                </div>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div style={{ position: "absolute", left: 10, top: 42, zIndex: 3, display: "flex", gap: 6, flexWrap: "wrap", maxWidth: 390 }}>
+        <button
+          onClick={() => setShowOnlySuspicious((prev) => !prev)}
+          style={{
+            border: `1px solid ${showOnlySuspicious ? "#ff436577" : "#244466"}`,
+            borderRadius: 8,
+            padding: "4px 8px",
+            background: showOnlySuspicious ? "rgba(255,67,101,0.16)" : "rgba(5,12,22,0.82)",
+            color: showOnlySuspicious ? "#ff9fb0" : "#91bbdf",
+            fontSize: 10,
+            cursor: "pointer",
+          }}
+        >
+          Suspicious Only
+        </button>
+        <button
+          onClick={() => setLayoutMode((prev) => (prev === "rings" ? "spiral" : "rings"))}
+          style={{
+            border: "1px solid #244466",
+            borderRadius: 8,
+            padding: "4px 8px",
+            background: "rgba(5,12,22,0.82)",
+            color: "#91bbdf",
+            fontSize: 10,
+            cursor: "pointer",
+          }}
+        >
+          Layout: {layoutMode === "rings" ? "Rings" : "Spiral"}
+        </button>
+        <button
+          onClick={() => setSizeMode((prev) => (prev === "impact" ? "uniform" : "impact"))}
+          style={{
+            border: "1px solid #244466",
+            borderRadius: 8,
+            padding: "4px 8px",
+            background: "rgba(5,12,22,0.82)",
+            color: "#91bbdf",
+            fontSize: 10,
+            cursor: "pointer",
+          }}
+        >
+          Size: {sizeMode === "impact" ? "Impact" : "Uniform"}
+        </button>
+        <button
+          onClick={() => setShowLabels((prev) => !prev)}
+          style={{
+            border: "1px solid #244466",
+            borderRadius: 8,
+            padding: "4px 8px",
+            background: "rgba(5,12,22,0.82)",
+            color: "#91bbdf",
+            fontSize: 10,
+            cursor: "pointer",
+          }}
+        >
+          Labels: {showLabels ? "On" : "Off"}
+        </button>
+        <button
+          onClick={() => {
+            if (!nodes.length) return;
+            const first = nodes[0];
+            setLockedAddress(first.address);
+            onNodeSelect({
+              address: first.address,
+              txCount: first.txCount,
+              suspiciousTxCount: first.suspiciousTxCount,
+              risk: first.risk,
+              suspicious: first.suspicious,
+            });
+          }}
+          style={{
+            border: "1px solid #2b5f8f",
+            borderRadius: 8,
+            padding: "4px 8px",
+            background: "rgba(21, 57, 92, 0.72)",
+            color: "#b4d6f2",
+            fontSize: 10,
+            cursor: "pointer",
+          }}
+        >
+          Open XAI Drawer
         </button>
       </div>
 
@@ -189,7 +474,7 @@ function MiniFlowGraph({
           fontFamily: "'JetBrains Mono', monospace",
         }}
       >
-        WHEEL TO ZOOM · DRAG TO PAN · HOVER NODES
+        WHEEL TO ZOOM · DRAG TO PAN · CLICK A WALLET NODE TO OPEN NODE XAI DRAWER
       </div>
 
       <svg
@@ -237,7 +522,8 @@ function MiniFlowGraph({
           {nodes.map((node) => {
             const controlX = (CENTER_X + node.x) / 2 + (CENTER_Y - node.y) * 0.12;
             const controlY = (CENTER_Y + node.y) / 2 + (node.x - CENTER_X) * 0.12;
-            const isHovered = hoveredAddress === node.address;
+            const isHovered = activeAddress === node.address;
+            const isDimmed = !!activeAddress && activeAddress !== node.address;
             return (
               <path
                 key={node.pairKey}
@@ -246,18 +532,37 @@ function MiniFlowGraph({
                 stroke={node.suspicious ? "#ff4365" : isHovered ? "#26b8ff" : "#2c7fbe"}
                 strokeWidth={node.suspicious ? 2.2 : isHovered ? 2 : 1.4}
                 strokeDasharray={node.suspicious ? "" : "5 5"}
-                strokeOpacity={node.suspicious ? 0.95 : 0.7}
+                strokeOpacity={isDimmed ? 0.18 : node.suspicious ? 0.95 : 0.7}
               />
             );
           })}
 
           {nodes.map((node) => {
-            const isHovered = hoveredAddress === node.address;
+            const isHovered = activeAddress === node.address;
+            const isDimmed = !!activeAddress && activeAddress !== node.address;
             return (
               <g
                 key={node.address}
                 onPointerEnter={() => setHoveredAddress(node.address)}
                 onPointerLeave={() => setHoveredAddress(null)}
+                onClick={() => {
+                  setLockedAddress((prev) => {
+                    const nextAddress = prev === node.address ? null : node.address;
+                    if (!nextAddress) {
+                      onNodeSelect(null);
+                    } else {
+                      onNodeSelect({
+                        address: node.address,
+                        txCount: node.txCount,
+                        suspiciousTxCount: node.suspiciousTxCount,
+                        risk: node.risk,
+                        suspicious: node.suspicious,
+                      });
+                    }
+                    return nextAddress;
+                  });
+                }}
+                style={{ cursor: "pointer" }}
               >
                 <circle
                   cx={node.x}
@@ -266,14 +571,28 @@ function MiniFlowGraph({
                   fill="#081426"
                   stroke={node.suspicious ? "#ff4365" : getRiskColor(node.risk)}
                   strokeWidth={isHovered ? 2.5 : 1.6}
+                  opacity={isDimmed ? 0.35 : 1}
                 />
                 <circle
                   cx={node.x}
                   cy={node.y}
                   r={Math.max(3, Math.min(7, node.nodeRadius * 0.35))}
                   fill={node.suspicious ? "#ff4365" : getRiskColor(node.risk)}
-                  opacity={0.9}
+                  opacity={isDimmed ? 0.38 : 0.9}
                 />
+                {showLabels && (
+                  <text
+                    x={node.x}
+                    y={node.y - (node.nodeRadius + 7)}
+                    fill="#b8d9f6"
+                    fontSize="8.5"
+                    textAnchor="middle"
+                    opacity={isDimmed ? 0.3 : 0.9}
+                    style={{ userSelect: "none" }}
+                  >
+                    {formatAddress(node.address)}
+                  </text>
+                )}
               </g>
             );
           })}
@@ -311,6 +630,19 @@ function MiniFlowGraph({
             fontFamily: "'JetBrains Mono', monospace",
           }}
         >
+          {nodes.length} nodes shown{showOnlySuspicious ? " (suspicious filter)" : ""}
+        </div>
+        <div
+          style={{
+            background: "rgba(5,12,22,0.84)",
+            border: "1px solid #1d3a5c",
+            borderRadius: 8,
+            padding: "6px 8px",
+            color: "#8db4d5",
+            fontSize: 10,
+            fontFamily: "'JetBrains Mono', monospace",
+          }}
+        >
           Zoom {zoom.toFixed(2)}x
         </div>
 
@@ -330,6 +662,66 @@ function MiniFlowGraph({
             <div style={{ color: "#89afcf", fontSize: 10 }}>
               {hoveredNode.txCount} txs · {hoveredNode.suspiciousTxCount} suspicious · risk {hoveredNode.risk}
             </div>
+          </div>
+        )}
+
+        {!lockedNode && (
+          <div
+            style={{
+              background: "rgba(8, 24, 44, 0.86)",
+              border: "1px dashed #2e608f",
+              borderRadius: 8,
+              padding: "7px 10px",
+              minWidth: 210,
+              color: "#9cc4e3",
+              fontSize: 10,
+            }}
+          >
+            Click any wallet node or use "Open XAI Drawer" to view explainable AI details.
+          </div>
+        )}
+
+        {lockedNode && (
+          <div
+            style={{
+              background: "rgba(5,12,22,0.96)",
+              border: `1px solid ${lockedNode.suspicious ? "#ff436588" : "#2d4f73"}`,
+              borderRadius: 8,
+              padding: "8px 10px",
+              minWidth: 250,
+              maxWidth: 330,
+            }}
+          >
+            <div style={{ color: "#d4e9ff", fontSize: 11, fontFamily: "'JetBrains Mono', monospace", marginBottom: 4 }}>
+              XAI Node: {formatAddress(lockedNode.address)}
+            </div>
+            <div style={{ color: "#89afcf", fontSize: 10, marginBottom: 6 }}>
+              {lockedNode.txCount} txs · {lockedNode.suspiciousTxCount} suspicious · risk {lockedNode.risk}
+            </div>
+
+            {nodeAiLoading && <div style={{ color: "#9bc6ea", fontSize: 10 }}>Generating explainable AI insights...</div>}
+            {nodeAiError && <div style={{ color: "#ff9db0", fontSize: 10 }}>{nodeAiError}</div>}
+
+            {!nodeAiLoading && !nodeAiError && nodeAi && (
+              <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 5 }}>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Anomaly</div>
+                <div style={{ color: "#d6ecff", fontSize: 9, textAlign: "right" }}>
+                  {nodeAi.models.transaction_anomaly_detector?.is_anomaly ? "Detected" : "Normal"}
+                </div>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Behavior Shift</div>
+                <div style={{ color: "#d6ecff", fontSize: 9, textAlign: "right" }}>
+                  {nodeAi.models.behavior_shift_detector?.behavior_shift_detected ? "Detected" : "None"}
+                </div>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Priority Score</div>
+                <div style={{ color: "#ffc083", fontSize: 9, textAlign: "right", fontWeight: 700 }}>
+                  {nodeAi.models.alert_prioritizer?.priority_score?.toFixed(1) ?? "-"}
+                </div>
+                <div style={{ color: "#6f99bc", fontSize: 9 }}>Decision</div>
+                <div style={{ color: "#9de6c2", fontSize: 9, textAlign: "right", fontWeight: 700 }}>
+                  {nodeAi.explainability?.decision?.toUpperCase() ?? "MONITOR"}
+                </div>
+              </div>
+            )}
           </div>
         )}
 
@@ -410,13 +802,88 @@ export function WalletAnalyzerPage() {
   const [copied, setCopied] = useState(false);
   const [detailTab, setDetailTab] = useState<"overview" | "threat">("overview");
   const [expandedIntelAddress, setExpandedIntelAddress] = useState<string | null>(null);
+  const [selectedGraphNode, setSelectedGraphNode] = useState<GraphNodeSelection | null>(null);
+  const [graphNodeAiCache, setGraphNodeAiCache] = useState<Record<string, MlAllFeaturesResponse | null>>({});
+  const [graphNodeAiLoading, setGraphNodeAiLoading] = useState<Record<string, boolean>>({});
+  const [graphNodeAiError, setGraphNodeAiError] = useState<Record<string, string | null>>({});
   const emailedAlertsRef = useRef<Set<string>>(new Set());
   const autoAnalyzedWalletRef = useRef<string | null>(null);
 
   useEffect(() => {
     setDetailTab("overview");
     setExpandedIntelAddress(null);
+    setSelectedGraphNode(null);
+    setGraphNodeAiCache({});
+    setGraphNodeAiLoading({});
+    setGraphNodeAiError({});
   }, [analysis?.wallet_address]);
+
+  const loadNodeExplainability = async (node: GraphNodeSelection | null) => {
+    setSelectedGraphNode(node);
+    if (!node || !analysis) return;
+
+    const address = node.address.toLowerCase();
+    const analysisAddress = analysis.wallet_address.toLowerCase();
+
+    if (address === analysisAddress || graphNodeAiCache[address] || graphNodeAiLoading[address]) return;
+
+    setGraphNodeAiLoading((prev) => ({ ...prev, [address]: true }));
+    setGraphNodeAiError((prev) => ({ ...prev, [address]: null }));
+
+    try {
+      const ai = await predictAllAiFeatures(address);
+      setGraphNodeAiCache((prev) => ({ ...prev, [address]: ai }));
+    } catch (err) {
+      setGraphNodeAiCache((prev) => ({ ...prev, [address]: null }));
+      setGraphNodeAiError((prev) => ({
+        ...prev,
+        [address]: err instanceof Error ? err.message : "Unable to fetch node explainability.",
+      }));
+    } finally {
+      setGraphNodeAiLoading((prev) => ({ ...prev, [address]: false }));
+    }
+  };
+
+  const selectedNodeAi = useMemo(() => {
+    if (!selectedGraphNode || !analysis) return null;
+    if (selectedGraphNode.address.toLowerCase() === analysis.wallet_address.toLowerCase()) {
+      return aiFeatures;
+    }
+    return graphNodeAiCache[selectedGraphNode.address.toLowerCase()] ?? null;
+  }, [selectedGraphNode, analysis, aiFeatures, graphNodeAiCache]);
+
+  const selectedNodeAiLoading = selectedGraphNode
+    ? (selectedGraphNode.address.toLowerCase() === analysis?.wallet_address.toLowerCase()
+      ? false
+      : !!graphNodeAiLoading[selectedGraphNode.address.toLowerCase()])
+    : false;
+
+  const selectedNodeAiError = selectedGraphNode
+    ? (selectedGraphNode.address.toLowerCase() === analysis?.wallet_address.toLowerCase()
+      ? null
+      : graphNodeAiError[selectedGraphNode.address.toLowerCase()] ?? null)
+    : null;
+
+  const selectedNodeTimeline = useMemo(() => {
+    if (!selectedGraphNode || !analysis) return [] as NodeTimelineItem[];
+
+    const target = selectedGraphNode.address.toLowerCase();
+    const suspiciousSet = new Set(analysis.suspicious_transactions.map((tx) => tx.hash));
+    const events = analysis.transaction_flow
+      .filter((tx) => tx.from.toLowerCase() === target || tx.to.toLowerCase() === target)
+      .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
+      .slice(0, 8)
+      .map((tx) => ({
+        id: tx.hash,
+        timestamp: new Date(tx.timestamp).toLocaleString(),
+        direction: tx.to.toLowerCase() === target ? "inbound" as const : "outbound" as const,
+        amountEth: tx.value_eth,
+        suspicious: suspiciousSet.has(tx.hash),
+        reasons: analysis.suspicious_transactions.find((s) => s.hash === tx.hash)?.reasons ?? [],
+      }));
+
+    return events;
+  }, [selectedGraphNode, analysis]);
 
   useEffect(() => {
     const session = getSession();
@@ -2024,6 +2491,14 @@ export function WalletAnalyzerPage() {
                     walletAddress={analysis.wallet_address.toLowerCase()}
                     counterparties={counterparties}
                     suspiciousPairs={suspiciousPairs}
+                    selectedNode={selectedGraphNode}
+                    nodeAi={selectedNodeAi}
+                    nodeAiLoading={selectedNodeAiLoading}
+                    nodeAiError={selectedNodeAiError}
+                    nodeTimeline={selectedNodeTimeline}
+                    onNodeSelect={(node) => {
+                      void loadNodeExplainability(node);
+                    }}
                   />
                 </div>
               </div>
